@@ -4,7 +4,13 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from server.indexer import discover_files, compute_file_hash, index_folder, EXCLUDE_PATTERNS
+from server.indexer import (
+    discover_files,
+    compute_file_hash,
+    index_folder,
+    _finalize_index,
+    EXCLUDE_PATTERNS,
+)
 from server.store import VectorStore
 
 
@@ -215,3 +221,72 @@ def test_index_folder_nonexistent_raises(mock_get_model, tmp_path):
 
     with pytest.raises(FileNotFoundError):
         index_folder("/nonexistent/folder", db_path=str(tmp_path / "testdb"))
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_reports_progress(mock_get_model, docs_dir, tmp_path):
+    """index_folder calls progress_callback as it works through the files."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    calls = []
+    index_folder(
+        str(docs_dir),
+        db_path=str(tmp_path / "testdb"),
+        progress_callback=lambda done, total: calls.append((done, total)),
+    )
+
+    assert calls, "progress_callback was never invoked"
+    assert all(total == 4 for _, total in calls)
+    assert calls[-1] == (4, 4)  # final call reports every file done
+    processed = [done for done, _ in calls]
+    assert processed == sorted(processed)  # monotonically non-decreasing
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_returns_finalize_warnings(mock_get_model, docs_dir, tmp_path):
+    """The return dict carries a finalize_warnings list (empty on a clean run)."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    result = index_folder(str(docs_dir), db_path=str(tmp_path / "testdb"))
+    assert result["finalize_warnings"] == []
+
+
+def test_finalize_index_skips_when_table_unchanged(tmp_path):
+    """When nothing changed, the ANN index is not rebuilt."""
+    store = VectorStore(str(tmp_path / "db"))
+    called = []
+    store.create_vector_index = lambda: called.append(True)
+
+    warnings = _finalize_index(store, table_changed=False)
+
+    assert warnings == []
+    assert called == []
+
+
+def test_finalize_index_builds_vector_index_when_changed(tmp_path):
+    """When the table changed, the finalize step builds the ANN index."""
+    store = VectorStore(str(tmp_path / "db"))
+    called = []
+    store.create_vector_index = lambda: called.append(True)
+
+    warnings = _finalize_index(store, table_changed=True)
+
+    assert called == [True]
+    assert warnings == []
+
+
+def test_finalize_index_captures_build_failure_as_warning(tmp_path):
+    """An ANN build error becomes a warning — it never fails the indexing run."""
+    store = VectorStore(str(tmp_path / "db"))
+
+    def boom():
+        raise RuntimeError("disk full")
+
+    store.create_vector_index = boom
+
+    warnings = _finalize_index(store, table_changed=True)
+
+    assert len(warnings) == 1
+    assert "disk full" in warnings[0]

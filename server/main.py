@@ -1,5 +1,6 @@
 """FastMCP server entry point with tool definitions."""
 
+import asyncio
 import os
 from typing import Annotated
 
@@ -9,10 +10,43 @@ from pydantic import Field
 mcp = FastMCP("Semantic Search")
 
 
+async def _run_index_job(job, file_types, recursive) -> None:
+    """Run the synchronous index_folder in a worker thread, recording progress
+    and the final outcome on the job record.
+
+    The CPU-bound embedding work runs off the event loop via asyncio.to_thread.
+    Any exception is captured onto the job so it never silently hangs in the
+    'running' state.
+    """
+    from server.jobs import registry
+    from server.indexer import index_folder as _index_folder
+
+    def progress(processed: int, total: int) -> None:
+        registry.update_progress(job.job_id, processed, total)
+
+    try:
+        result = await asyncio.to_thread(
+            _index_folder,
+            job.folder_path,
+            file_types,
+            recursive,
+            job.db_path,
+            progress,
+        )
+        registry.mark_completed(
+            job.job_id, result, result.get("finalize_warnings", [])
+        )
+    except asyncio.CancelledError:
+        registry.mark_failed(job.job_id, "cancelled (server shutting down)")
+        raise
+    except Exception as e:
+        registry.mark_failed(job.job_id, str(e))
+
+
 @mcp.tool(
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}
 )
-def index_folder(
+async def index_folder(
     folder_path: Annotated[str, Field(description="Absolute path to the folder to index")],
     file_types: Annotated[
         list[str] | None,
@@ -26,22 +60,54 @@ def index_folder(
         bool,
         Field(description="Whether to index subdirectories recursively", default=True),
     ] = True,
+    db_path: Annotated[
+        str | None,
+        Field(
+            description="Path to the LanceDB database. Uses LANCEDB_PATH env var if omitted.",
+            default=None,
+        ),
+    ] = None,
 ) -> dict:
-    """Index or re-index all documents in a folder for semantic search.
+    """Start a background job to index or re-index all documents in a folder.
 
     Scans the folder for supported document types (.txt, .md, .pdf, .docx,
-    .pptx, .csv), extracts text, splits into chunks, computes embeddings,
-    and stores them in a local vector database.
-    Only processes files that have changed since the last indexing run.
-    Safe to call multiple times — unchanged files are skipped automatically.
-    """
-    from server.indexer import index_folder as _index_folder
+    .pptx, .csv), extracts text, splits into chunks, computes embeddings, stores
+    them in a local vector database, and builds an ANN index for fast search.
+    Only files that have changed since the last run are re-processed.
 
-    return _index_folder(
-        folder_path=folder_path,
-        file_types=file_types,
-        recursive=recursive,
-    )
+    Indexing runs in the background: this call returns immediately with a
+    job_id. Poll get_index_status to follow progress and read the final result.
+    Only one indexing job runs at a time — a call made while another job is
+    running is rejected. Job state is in-memory and does not survive a server
+    restart (re-running is cheap: unchanged files are skipped).
+    """
+    from server.jobs import registry
+
+    if not os.path.isdir(folder_path):
+        raise FileNotFoundError(f"Folder not found: {folder_path}")
+
+    if db_path is None:
+        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+    db_dir = os.path.abspath(db_path)
+
+    if registry.has_running():
+        active = registry.active()
+        return {
+            "status": "rejected",
+            "message": "An indexing job is already running. "
+                       "Poll get_index_status for progress.",
+            "running_job_id": active[0].job_id if active else None,
+        }
+
+    job = registry.create(folder_path, db_dir)
+    job.task = asyncio.create_task(_run_index_job(job, file_types, recursive))
+    return {
+        "status": "started",
+        "job_id": job.job_id,
+        "folder_path": folder_path,
+        "message": "Indexing started in the background. "
+                   "Poll get_index_status for progress.",
+    }
 
 
 @mcp.tool(
@@ -110,26 +176,40 @@ def get_index_status(
         ),
     ] = None,
 ) -> dict:
-    """Get status information about the current search index.
+    """Get status of the search index and any background indexing jobs.
 
-    Returns total chunks, list of indexed files with chunk counts,
-    and file type distribution.
+    Returns total chunks and the list of indexed files, plus a `jobs` section
+    with active and recently-finished indexing jobs — poll this to follow an
+    index_folder run. Job state is in-memory and resets on server restart.
     """
     from server.store import VectorStore
     from server.paths import to_absolute
+    from server.jobs import registry
 
     if db_path is None:
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
     db_dir = os.path.abspath(db_path)
 
-    store = VectorStore(db_dir)
-    total_chunks = store.count_chunks()
-    indexed_files = [to_absolute(f, db_dir) for f in store.get_all_files()]
+    stats = {"total_chunks": 0, "total_files": 0, "indexed_files": []}
+    try:
+        store = VectorStore(db_dir)
+        indexed_files = sorted(
+            to_absolute(f, db_dir) for f in store.get_all_files()
+        )
+        stats = {
+            "total_chunks": store.count_chunks(),
+            "total_files": len(indexed_files),
+            "indexed_files": indexed_files,
+        }
+    except Exception:
+        pass  # status must stay readable even if the DB is missing or busy
 
     return {
-        "total_chunks": total_chunks,
-        "total_files": len(indexed_files),
-        "indexed_files": sorted(indexed_files),
+        **stats,
+        "jobs": {
+            "active": [j.to_dict() for j in registry.active()],
+            "recent": [j.to_dict() for j in registry.recent()],
+        },
     }
 
 
@@ -151,7 +231,20 @@ def reindex_file(
     Deletes existing chunks for this file, re-parses, re-chunks,
     re-embeds, and stores new chunks. Useful when you know a file
     has changed or when parsing was updated.
+
+    Rejected while a background index_folder job is running, to keep a single
+    writer on the index — retry once that job finishes.
     """
+    from server.jobs import registry
+
+    if registry.has_running():
+        active = registry.active()
+        return {
+            "status": "rejected",
+            "message": "An indexing job is running; retry reindex_file once it finishes.",
+            "running_job_id": active[0].job_id if active else None,
+        }
+
     from pathlib import Path
     from server.parsers import extract_text
     from server.chunker import chunk_document

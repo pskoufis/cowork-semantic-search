@@ -19,6 +19,11 @@ SCHEMA = pa.schema([
 
 TABLE_NAME = "chunks"
 
+# Minimum row count before an ANN index is worth building. Below this a flat
+# scan is already sub-millisecond and IVF_PQ has too few rows to train a useful
+# codebook; above it is the regime an ANN index exists for.
+VECTOR_INDEX_MIN_ROWS = 20_000
+
 
 def _escape(value: str) -> str:
     """Double single quotes for safe interpolation into LanceDB where-clauses."""
@@ -102,6 +107,29 @@ class VectorStore:
         if table is None:
             return
         table.create_fts_index("text", replace=True)
+
+    def create_vector_index(self) -> None:
+        """Build (or rebuild) an IVF_PQ ANN index on the vector column.
+
+        No-ops while the table is small (below VECTOR_INDEX_MIN_ROWS rows):
+        a flat scan is already fast there and IVF_PQ cannot train. Above the
+        threshold the index is built with replace=True, so each call supersedes
+        the previous index as the table grows.
+        """
+        table = self._get_table()
+        if table is None:
+            return
+        n = table.count_rows()
+        if n < VECTOR_INDEX_MIN_ROWS:
+            return
+        table.create_index(
+            metric="cosine",
+            vector_column_name="vector",
+            index_type="IVF_PQ",
+            num_partitions=max(1, n // 4096),
+            num_sub_vectors=48,  # embedding dimension 384 / 8
+            replace=True,
+        )
 
     def fts_search(
         self,
