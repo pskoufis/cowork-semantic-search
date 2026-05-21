@@ -4,6 +4,7 @@ import hashlib
 import os
 import time
 from pathlib import Path
+from typing import Callable
 
 from server.parsers import extract_text, SUPPORTED_EXTENSIONS
 from server.chunker import chunk_document
@@ -60,11 +61,29 @@ def embed_chunks(chunks: list[dict]) -> list[dict]:
     return chunks
 
 
+def _finalize_index(store: VectorStore, *, table_changed: bool) -> list[str]:
+    """Post-indexing finalize step. Builds the ANN index when the table changed.
+
+    Errors here are captured as warnings and never raised — an index-build
+    hiccup must not fail a multi-hour indexing run. This is the extension point
+    Tier 2's FTS index build will plug into.
+    """
+    warnings: list[str] = []
+    if not table_changed:
+        return warnings
+    try:
+        store.create_vector_index()
+    except Exception as e:
+        warnings.append(f"vector index build failed: {e}")
+    return warnings
+
+
 def index_folder(
     folder_path: str,
     file_types: list[str] | None = None,
     recursive: bool = True,
     db_path: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict:
     folder = Path(folder_path)
     if not folder.exists():
@@ -84,7 +103,9 @@ def index_folder(
     errors = []
     current_files = set()  # paths relative to the index directory
 
-    for file_path in files:
+    for idx, file_path in enumerate(files):
+        if progress_callback is not None:
+            progress_callback(idx, len(files))
         try:
             source_rel = to_relative(str(file_path), db_dir)
         except ValueError as e:  # file on a different volume than the index
@@ -113,6 +134,9 @@ def index_folder(
             failed += 1
             errors.append({"file": str(file_path), "error": str(e)})
 
+    if progress_callback is not None:
+        progress_callback(len(files), len(files))
+
     # Clean up chunks for files deleted from within this folder only.
     # Stored paths are relative — resolve to absolute before the scope check.
     for f_rel in store.get_all_files():
@@ -125,6 +149,11 @@ def index_folder(
             store.delete_by_file(f_rel)
             deleted += 1
 
+    # Finalize: (re)build the ANN index when this run changed the table.
+    finalize_warnings = _finalize_index(
+        store, table_changed=(indexed > 0 or deleted > 0)
+    )
+
     return {
         "status": "completed",
         "folder_path": folder_path,
@@ -134,5 +163,6 @@ def index_folder(
         "files_failed": failed,
         "total_chunks": store.count_chunks(),
         "errors": errors,
+        "finalize_warnings": finalize_warnings,
         "duration_seconds": round(time.time() - start, 2),
     }

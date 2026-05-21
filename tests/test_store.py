@@ -159,3 +159,56 @@ def test_hybrid_search(store):
     assert len(results) >= 1
     assert "revenue" in results[0]["text"]
     assert "rrf_score" in results[0]
+
+
+def _random_chunks(n: int) -> list[dict]:
+    """n chunk dicts with unique ids and random unit vectors — no embedding model."""
+    chunks = []
+    for i in range(n):
+        rng = np.random.RandomState(i)
+        vec = rng.randn(384).astype(np.float32)
+        vec = vec / np.linalg.norm(vec)
+        chunks.append({
+            "id": f"c_{i}",
+            "text": f"document number {i}",
+            "source_file": f"/fake/doc_{i}.txt",
+            "file_name": f"doc_{i}.txt",
+            "file_type": ".txt",
+            "folder_path": "/fake",
+            "chunk_index": 0,
+            "content_hash": "h",
+            "vector": vec.tolist(),
+        })
+    return chunks
+
+
+def test_create_vector_index_noop_on_empty_store(store):
+    """No table yet — create_vector_index must not raise."""
+    store.create_vector_index()
+    assert store.count_chunks() == 0
+
+
+def test_create_vector_index_noop_below_threshold(store, monkeypatch):
+    """Below VECTOR_INDEX_MIN_ROWS rows, no ANN index is built (flat scan is fine)."""
+    monkeypatch.setattr("server.store.VECTOR_INDEX_MIN_ROWS", 1000)
+    store.add_chunks(_random_chunks(20))
+    store.create_vector_index()
+    assert store._get_table().list_indices() == []
+
+
+def test_create_vector_index_builds_above_threshold(store, monkeypatch):
+    """At or above the threshold, an IVF_PQ index is built on the vector column."""
+    monkeypatch.setattr("server.store.VECTOR_INDEX_MIN_ROWS", 256)
+    store.add_chunks(_random_chunks(600))
+    store.create_vector_index()
+    indices = store._get_table().list_indices()
+    assert len(indices) == 1
+
+
+def test_create_vector_index_refresh_is_idempotent(store, monkeypatch):
+    """Re-running create_vector_index replaces the index rather than erroring."""
+    monkeypatch.setattr("server.store.VECTOR_INDEX_MIN_ROWS", 256)
+    store.add_chunks(_random_chunks(600))
+    store.create_vector_index()
+    store.create_vector_index()
+    assert len(store._get_table().list_indices()) == 1
