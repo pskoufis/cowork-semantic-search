@@ -20,6 +20,11 @@ SCHEMA = pa.schema([
 TABLE_NAME = "chunks"
 
 
+def _escape(value: str) -> str:
+    """Double single quotes for safe interpolation into LanceDB where-clauses."""
+    return value.replace("'", "''")
+
+
 class VectorStore:
     def __init__(self, db_path: str):
         self._db_path = db_path
@@ -69,7 +74,7 @@ class VectorStore:
             return None
         results = (
             table.search()
-            .where(f"source_file = '{source_file}'", prefilter=True)
+            .where(f"source_file = '{_escape(source_file)}'", prefilter=True)
             .select(["content_hash"])
             .limit(1)
             .to_list()
@@ -82,7 +87,7 @@ class VectorStore:
         table = self._get_table()
         if table is None:
             return
-        table.delete(f"source_file = '{source_file}'")
+        table.delete(f"source_file = '{_escape(source_file)}'")
 
     def get_all_files(self) -> list[str]:
         table = self._get_table()
@@ -118,9 +123,9 @@ class VectorStore:
 
         where_clauses = []
         if folder_path:
-            where_clauses.append(f"folder_path = '{folder_path}'")
+            where_clauses.append(f"folder_path = '{_escape(folder_path)}'")
         if file_type:
-            where_clauses.append(f"file_type = '{file_type}'")
+            where_clauses.append(f"file_type = '{_escape(file_type)}'")
         if where_clauses:
             query = query.where(" AND ".join(where_clauses), prefilter=True)
 
@@ -195,9 +200,9 @@ class VectorStore:
 
         where_clauses = []
         if folder_path:
-            where_clauses.append(f"folder_path = '{folder_path}'")
+            where_clauses.append(f"folder_path = '{_escape(folder_path)}'")
         if file_type:
-            where_clauses.append(f"file_type = '{file_type}'")
+            where_clauses.append(f"file_type = '{_escape(file_type)}'")
         if where_clauses:
             query = query.where(" AND ".join(where_clauses), prefilter=True)
 

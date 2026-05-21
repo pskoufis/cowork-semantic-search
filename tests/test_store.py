@@ -106,6 +106,28 @@ def test_vector_search_with_folder_filter(store):
     assert results[0]["folder_path"] == "/folder_a"
 
 
+def test_apostrophe_in_path_is_query_safe(store):
+    """Single quotes in paths must not break where/delete clauses."""
+    tricky = "/fake/Bob's notes.txt"
+    chunks = _make_chunks(["report content"], source_file=tricky, file_hash="hash_q")
+    chunks[0]["folder_path"] = "/fake/Bob's docs"
+    store.add_chunks(chunks)
+
+    # get_file_hash builds a where-clause from the path
+    assert store.get_file_hash(tricky) == "hash_q"
+
+    # vector_search folder filter builds a where-clause from folder_path
+    results = store.vector_search(
+        chunks[0]["vector"], top_k=10, folder_path="/fake/Bob's docs"
+    )
+    assert len(results) == 1
+    assert results[0]["source_file"] == tricky
+
+    # delete_by_file builds a delete-clause from the path
+    store.delete_by_file(tricky)
+    assert store.count_chunks() == 0
+
+
 def test_fts_search(store):
     chunks = _make_chunks(
         ["revenue grew 23% in Q3", "the cat sat on the mat", "python programming"],

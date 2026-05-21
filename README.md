@@ -270,7 +270,7 @@ source .venv/bin/activate
 pytest tests/ -v
 ```
 
-66 tests covering parsers, chunking, indexing, search, path portability, and MCP tool integration.
+68 tests covering parsers, chunking, indexing, search, path portability, and MCP tool integration.
 
 Contributions welcome -- open an issue or submit a PR.
 

@@ -186,6 +186,29 @@ def test_index_survives_relocation(mock_get_model, tmp_path):
 
 
 @patch("server.indexer.get_model")
+def test_index_folder_handles_apostrophe_in_path(mock_get_model, tmp_path):
+    """A file whose path contains a single quote is skip-detected on re-runs."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    db_path = str(tmp_path / "testdb")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "Bob's notes.txt").write_text("Quarterly revenue figures for Bob.")
+
+    r1 = index_folder(str(corpus), db_path=db_path)
+    assert r1["files_indexed"] == 1
+    chunks_after_first = r1["total_chunks"]
+
+    # Second run: the path has an apostrophe; the skip-detection clause must be
+    # well-formed so the unchanged file is skipped, not re-indexed/duplicated.
+    r2 = index_folder(str(corpus), db_path=db_path)
+    assert r2["files_indexed"] == 0
+    assert r2["files_skipped"] == 1
+    assert r2["total_chunks"] == chunks_after_first
+
+
+@patch("server.indexer.get_model")
 def test_index_folder_nonexistent_raises(mock_get_model, tmp_path):
     mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
     mock_get_model.return_value = mock_model
