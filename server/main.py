@@ -61,7 +61,8 @@ async def index_folder(
         list[str] | None,
         Field(
             description="File extensions to index, e.g. ['.pdf', '.md']. "
-                        "Defaults to all supported types: .txt, .md, .pdf, .docx, .pptx, .csv",
+                        "Defaults to all supported types: .txt, .md, .pdf, "
+                        ".docx, .pptx, .csv, .pst",
             default=None,
         ),
     ] = None,
@@ -80,9 +81,9 @@ async def index_folder(
     """Start a background job to index or re-index all documents in a folder.
 
     Scans the folder for supported document types (.txt, .md, .pdf, .docx,
-    .pptx, .csv), extracts text, splits into chunks, computes embeddings, stores
-    them in a local vector database, and builds an ANN index for fast search.
-    Only files that have changed since the last run are re-processed.
+    .pptx, .csv, .pst), extracts text, splits into chunks, computes embeddings,
+    stores them in a local vector database, and builds an ANN index for fast
+    search. Only files that have changed since the last run are re-processed.
 
     Indexing runs in the background: this call returns immediately with a
     job_id. Poll get_index_status to follow progress and read the final result.
@@ -92,7 +93,8 @@ async def index_folder(
     simply re-run to recover (unchanged files are skipped, so it is cheap).
 
     Files larger than the MAX_FILE_SIZE_MB cap (default 100 MB) are skipped and
-    reported in the result's oversized_files list rather than indexed.
+    reported in the result's oversized_files list rather than indexed; .pst
+    archives stream from disk and are exempt from the cap.
     """
     from server.jobs import registry
 
@@ -259,7 +261,7 @@ def reindex_file(
     Rejected while a background index_folder job is running, to keep a single
     writer on the index — retry once that job finishes. A file over the
     MAX_FILE_SIZE_MB cap (default 100 MB) is returned with status 'skipped' and
-    the index is left untouched.
+    the index is left untouched; .pst archives are exempt from the cap.
     """
     from server.jobs import registry
 
@@ -274,7 +276,9 @@ def reindex_file(
     from pathlib import Path
     from server.parsers import extract_text
     from server.chunker import chunk_document
-    from server.indexer import embed_chunks, compute_file_hash, MAX_FILE_SIZE_BYTES
+    from server.indexer import (
+        embed_chunks, compute_file_hash, MAX_FILE_SIZE_BYTES, exceeds_size_cap,
+    )
     from server.store import VectorStore
     from server.paths import to_relative
 
@@ -283,8 +287,9 @@ def reindex_file(
         raise FileNotFoundError(f"File not found: {file_path}")
 
     stat = path.stat()
-    if MAX_FILE_SIZE_BYTES and stat.st_size > MAX_FILE_SIZE_BYTES:
+    if exceeds_size_cap(path, stat.st_size):
         # Too large to parse without risking an OOM; leave the index untouched.
+        # Streaming formats (.pst) are exempt from the cap.
         return {
             "status": "skipped",
             "file_path": file_path,

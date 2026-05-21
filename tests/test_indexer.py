@@ -513,6 +513,33 @@ def test_size_cap_disabled_indexes_everything(mock_get_model, tmp_path, monkeypa
     assert result["files_size_skipped"] == 0
 
 
+@patch("server.indexer.get_model")
+def test_index_folder_exempts_pst_from_size_cap(mock_get_model, tmp_path, monkeypatch):
+    """A .pst over the cap is indexed, not reported oversized — pypff streams
+    the archive. A non-streaming file of the same size is still skipped."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+    monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 1024)
+    # The fake .pst is not a real archive; parse it to a fixed part instead.
+    monkeypatch.setattr(
+        "server.parsers._extract_pst",
+        lambda path: [{"text": "a mail message about revenue", "metadata": {}}],
+    )
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "archive.pst").write_bytes(b"x" * 4096)  # over the 1 KB cap
+    (corpus / "huge.txt").write_text("x" * 4096)        # over the 1 KB cap
+
+    result = index_folder(str(corpus), db_path=str(tmp_path / "db"))
+
+    assert result["files_indexed"] == 1       # the .pst was indexed
+    assert result["files_size_skipped"] == 1  # the .txt was skipped
+    oversized = [o["file"] for o in result["oversized_files"]]
+    assert any(f.endswith("huge.txt") for f in oversized)
+    assert not any(f.endswith("archive.pst") for f in oversized)
+
+
 # -- Tier 3: embedding device selection (item 4.10) --------------------------
 
 def test_select_device_prefers_mps_when_available():

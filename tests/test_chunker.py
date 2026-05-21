@@ -77,3 +77,32 @@ def test_chunk_folder_path_derived_from_relative_source():
     # A file at the index-directory level has no parent segment.
     top = chunk_document(parts, "doc.txt")
     assert top[0]["folder_path"] == "."
+
+
+def test_chunk_ids_unique_when_parts_lack_page_number():
+    """Regression: parts without a page_number (PPTX slides, PST messages)
+    must still get unique ids. The old id keyed its middle segment on
+    page_number, so every such part collapsed to the same prefix."""
+    parts = [
+        {"text": "Slide one content. " * 30, "metadata": {"slide_number": 1}},
+        {"text": "Slide two content. " * 30, "metadata": {"slide_number": 2}},
+        {"text": "Slide three content. " * 30, "metadata": {"slide_number": 3}},
+    ]
+    chunks = chunk_document(parts, "../corpus/deck.pptx")
+    ids = [c["id"] for c in chunks]
+    indices = [c["chunk_index"] for c in chunks]
+    assert len(ids) == len(set(ids))
+    assert len(indices) == len(set(indices))
+
+
+def test_chunk_index_is_global_across_parts():
+    """chunk_index runs continuously across parts, never restarting per part,
+    so (source_file, chunk_index) is unique — the key hybrid search dedupes on.
+    A per-part counter would make every part's first chunk collide on index 0."""
+    parts = [
+        {"text": "First message body. " * 30, "metadata": {}},
+        {"text": "Second message body. " * 30, "metadata": {}},
+    ]
+    chunks = chunk_document(parts, "archive.pst")
+    indices = [c["chunk_index"] for c in chunks]
+    assert indices == list(range(len(chunks)))
