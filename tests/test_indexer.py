@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from server.indexer import discover_files, compute_file_hash, index_folder, EXCLUDE_PATTERNS
+from server.store import VectorStore
 
 
 @pytest.fixture
@@ -117,6 +118,94 @@ def test_index_folder_detects_deleted_files(mock_get_model, docs_dir, tmp_path):
     (docs_dir / "notes.txt").unlink()
     r2 = index_folder(str(docs_dir), db_path=db_path)
     assert r2["files_deleted"] == 1
+
+
+@patch("server.indexer.get_model")
+def test_indexing_second_folder_preserves_first(mock_get_model, tmp_path):
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    db_path = str(tmp_path / "testdb")
+    folder_a = tmp_path / "folder_a"
+    folder_a.mkdir()
+    folder_b = tmp_path / "folder_b"
+    folder_b.mkdir()
+    (folder_a / "a.txt").write_text("Alpha content about revenue.")
+    (folder_b / "b.txt").write_text("Beta content about expenses.")
+
+    index_folder(str(folder_a), db_path=db_path)
+    index_folder(str(folder_b), db_path=db_path)  # must NOT wipe folder A
+
+    files = VectorStore(db_path).get_all_files()
+    assert any("a.txt" in f for f in files)
+    assert any("b.txt" in f for f in files)
+
+
+@patch("server.indexer.get_model")
+def test_index_survives_relocation(mock_get_model, tmp_path):
+    """Moving the index + corpus to a new absolute path does not re-index."""
+    import shutil
+
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    # Lay out the index and corpus as siblings on one "drive".
+    root_a = tmp_path / "drive_a"
+    corpus_a = root_a / "corpus"
+    corpus_a.mkdir(parents=True)
+    db_a = root_a / "lancedb"
+    (corpus_a / "readme.md").write_text("# Revenue\n\nQ3 revenue grew 23%.")
+    (corpus_a / "notes.txt").write_text("Meeting notes about revenue.")
+    (corpus_a / "sub").mkdir()
+    (corpus_a / "sub" / "deep.txt").write_text("Nested revenue details.")
+
+    r1 = index_folder(str(corpus_a), db_path=str(db_a))
+    assert r1["files_indexed"] == 3
+
+    # Simulate re-plugging the drive at a different absolute mount point.
+    root_b = tmp_path / "drive_b_other_mount"
+    shutil.move(str(root_a), str(root_b))
+    corpus_b = root_b / "corpus"
+    db_b = root_b / "lancedb"
+
+    r2 = index_folder(str(corpus_b), db_path=str(db_b))
+    assert r2["files_indexed"] == 0      # nothing re-indexed
+    assert r2["files_skipped"] == 3      # all skipped via hash match
+    assert r2["files_deleted"] == 0      # no false orphans
+
+    from server.search import semantic_search
+    with patch("server.search.get_model", return_value=mock_model):
+        res = semantic_search("revenue", db_path=str(db_b))
+        hybrid = semantic_search("revenue", db_path=str(db_b), mode="hybrid")
+
+    assert res["total_results"] > 0
+    assert hybrid["total_results"] > 0
+    # Displayed paths resolve to the new location, for both search modes.
+    assert all(str(corpus_b) in r["source_file"] for r in res["results"])
+    assert all(str(corpus_b) in r["source_file"] for r in hybrid["results"])
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_handles_apostrophe_in_path(mock_get_model, tmp_path):
+    """A file whose path contains a single quote is skip-detected on re-runs."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    db_path = str(tmp_path / "testdb")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "Bob's notes.txt").write_text("Quarterly revenue figures for Bob.")
+
+    r1 = index_folder(str(corpus), db_path=db_path)
+    assert r1["files_indexed"] == 1
+    chunks_after_first = r1["total_chunks"]
+
+    # Second run: the path has an apostrophe; the skip-detection clause must be
+    # well-formed so the unchanged file is skipped, not re-indexed/duplicated.
+    r2 = index_folder(str(corpus), db_path=db_path)
+    assert r2["files_indexed"] == 0
+    assert r2["files_skipped"] == 1
+    assert r2["total_chunks"] == chunks_after_first
 
 
 @patch("server.indexer.get_model")

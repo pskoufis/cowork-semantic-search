@@ -1,12 +1,14 @@
 """Document indexing pipeline: discover, parse, chunk, embed, store."""
 
 import hashlib
+import os
 import time
 from pathlib import Path
 
 from server.parsers import extract_text, SUPPORTED_EXTENSIONS
 from server.chunker import chunk_document
 from server.store import VectorStore
+from server.paths import to_relative, to_absolute
 
 EXCLUDE_PATTERNS = {"__pycache__", ".git", ".DS_Store", "node_modules", ".venv", "*.tmp"}
 BATCH_SIZE = 64
@@ -68,32 +70,39 @@ def index_folder(
     if not folder.exists():
         raise FileNotFoundError(f"Folder not found: {folder_path}")
 
-    import os
     if db_path is None:
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+    db_dir = os.path.abspath(db_path)
 
-    store = VectorStore(db_path)
+    store = VectorStore(db_dir)
     type_set = set(file_types) if file_types else None
     files = discover_files(folder, type_set, recursive)
+    folder_resolved = folder.resolve()
 
     start = time.time()
     indexed, skipped, deleted, failed = 0, 0, 0, 0
     errors = []
-    current_files = set()
+    current_files = set()  # paths relative to the index directory
 
     for file_path in files:
-        current_files.add(str(file_path))
+        try:
+            source_rel = to_relative(str(file_path), db_dir)
+        except ValueError as e:  # file on a different volume than the index
+            failed += 1
+            errors.append({"file": str(file_path), "error": str(e)})
+            continue
+        current_files.add(source_rel)
         file_hash = compute_file_hash(file_path)
 
-        existing_hash = store.get_file_hash(str(file_path))
+        existing_hash = store.get_file_hash(source_rel)
         if existing_hash == file_hash:
             skipped += 1
             continue
 
         try:
-            store.delete_by_file(str(file_path))
+            store.delete_by_file(source_rel)
             parts = extract_text(file_path)
-            chunks = chunk_document(parts, file_path)
+            chunks = chunk_document(parts, source_rel)
             if chunks:
                 chunks = embed_chunks(chunks)
                 for c in chunks:
@@ -104,11 +113,16 @@ def index_folder(
             failed += 1
             errors.append({"file": str(file_path), "error": str(e)})
 
-    # Clean up chunks from deleted files
-    indexed_files = store.get_all_files()
-    for f in indexed_files:
-        if f not in current_files:
-            store.delete_by_file(f)
+    # Clean up chunks for files deleted from within this folder only.
+    # Stored paths are relative — resolve to absolute before the scope check.
+    for f_rel in store.get_all_files():
+        f_abs = Path(to_absolute(f_rel, db_dir))
+        in_scope = (
+            f_abs.is_relative_to(folder_resolved) if recursive
+            else f_abs.parent == folder_resolved
+        )
+        if in_scope and f_rel not in current_files:
+            store.delete_by_file(f_rel)
             deleted += 1
 
     return {
