@@ -192,11 +192,43 @@ Works the same with PDFs, Word docs, PowerPoints, and CSVs -- just point it at a
 ## Advanced Usage
 
 <details>
+<summary><strong>Portable index (external drive)</strong></summary>
+
+By default the index lives in `./lancedb` next to the server. To make the index **portable** -- so it survives an external drive being re-plugged at a different mount point, or moved between Macs -- set the `LANCEDB_PATH` environment variable to a directory **on the same drive as your documents**:
+
+```json
+{
+  "mcpServers": {
+    "semantic-search": {
+      "command": "/absolute/path/to/.venv/bin/python",
+      "args": ["-m", "server.main"],
+      "env": {
+        "PYTHONPATH": "/absolute/path/to/cowork-semantic-search",
+        "LANCEDB_PATH": "/Volumes/MyDrive/.semantic-index"
+      }
+    }
+  }
+}
+```
+
+The index stores document paths **relative to `LANCEDB_PATH`**, so as long as the index directory and the indexed folders stay on the same volume, you can unplug the drive, re-plug it (even at a different mount point), or move it to another Mac -- incremental indexing and search keep working without re-indexing.
+
+Notes:
+- The index directory and **all** indexed folders must be on the same volume.
+- Mount points differ per machine, so set `LANCEDB_PATH` to wherever the drive mounts on each Mac (e.g. `/Volumes/MyDrive` vs `/Volumes/MyDrive-1`).
+- Use an **absolute** path -- the `./lancedb` default is relative to the working directory and is not portable.
+
+</details>
+
+<details>
 <summary><strong>Use as a Python library</strong></summary>
 
 ```python
 from server.indexer import index_folder
 from server.search import semantic_search
+
+# For a portable index, set the LANCEDB_PATH env var to an absolute path
+# on the same drive as your documents (see "Portable index" above).
 
 # Index a folder
 result = index_folder("/path/to/docs")
@@ -238,7 +270,7 @@ source .venv/bin/activate
 pytest tests/ -v
 ```
 
-56 tests covering parsers, chunking, indexing, search, and MCP tool integration.
+66 tests covering parsers, chunking, indexing, search, path portability, and MCP tool integration.
 
 Contributions welcome -- open an issue or submit a PR.
 

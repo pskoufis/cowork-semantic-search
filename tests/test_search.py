@@ -1,4 +1,4 @@
-from pathlib import Path
+import os
 from unittest.mock import patch
 
 import numpy as np
@@ -6,6 +6,7 @@ import pytest
 
 from server.search import semantic_search
 from server.store import VectorStore
+from server.paths import to_absolute
 
 
 def _fake_embed(texts):
@@ -18,7 +19,11 @@ def _fake_embed(texts):
     return np.array(results)
 
 
-def _seed_store(store: VectorStore, texts: list[str], source_file: str = "/fake/doc.txt"):
+def _seed_store(store: VectorStore, texts: list[str], source_file: str = "corpus/doc.txt"):
+    """Seed the store directly. source_file is a path relative to the index
+    directory, matching what the indexer now writes."""
+    file_name = os.path.basename(source_file)
+    folder_path = os.path.dirname(source_file) or "."
     chunks = []
     for i, text in enumerate(texts):
         vec = _fake_embed([text])[0]
@@ -26,9 +31,9 @@ def _seed_store(store: VectorStore, texts: list[str], source_file: str = "/fake/
             "id": f"chunk_{hash(text) % 10000}_{i}",
             "text": text,
             "source_file": source_file,
-            "file_name": source_file.split("/")[-1],
+            "file_name": file_name,
             "file_type": ".txt",
-            "folder_path": str(Path(source_file).parent),
+            "folder_path": folder_path,
             "chunk_index": i,
             "content_hash": "fakehash",
             "vector": vec.tolist(),
@@ -75,12 +80,18 @@ def test_semantic_search_with_folder_filter(mock_get_model, tmp_path):
 
     db_path = str(tmp_path / "testdb")
     store = VectorStore(db_path)
-    _seed_store(store, ["doc in folder a"], source_file="/folder_a/doc.txt")
-    _seed_store(store, ["doc in folder b"], source_file="/folder_b/doc.txt")
+    _seed_store(store, ["doc in folder a"], source_file="folder_a/doc.txt")
+    _seed_store(store, ["doc in folder b"], source_file="folder_b/doc.txt")
 
-    result = semantic_search("doc", db_path=db_path, folder_path="/folder_a")
+    # The caller passes an absolute folder path; search converts it to the
+    # stored relative form internally.
+    result = semantic_search(
+        "doc", db_path=db_path, folder_path=to_absolute("folder_a", db_path)
+    )
+    assert len(result["results"]) >= 1
     for r in result["results"]:
-        assert "/folder_a" in r["source_file"]
+        assert "folder_a" in r["source_file"]
+        assert "folder_b" not in r["source_file"]
 
 
 @patch("server.search.get_model")

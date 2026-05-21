@@ -116,13 +116,15 @@ def get_index_status(
     and file type distribution.
     """
     from server.store import VectorStore
+    from server.paths import to_absolute
 
     if db_path is None:
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+    db_dir = os.path.abspath(db_path)
 
-    store = VectorStore(db_path)
+    store = VectorStore(db_dir)
     total_chunks = store.count_chunks()
-    indexed_files = store.get_all_files()
+    indexed_files = [to_absolute(f, db_dir) for f in store.get_all_files()]
 
     return {
         "total_chunks": total_chunks,
@@ -155,6 +157,7 @@ def reindex_file(
     from server.chunker import chunk_document
     from server.indexer import embed_chunks, compute_file_hash
     from server.store import VectorStore
+    from server.paths import to_relative
 
     path = Path(file_path)
     if not path.exists():
@@ -162,12 +165,15 @@ def reindex_file(
 
     if db_path is None:
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+    db_dir = os.path.abspath(db_path)
 
-    store = VectorStore(db_path)
-    store.delete_by_file(str(path))
+    source_rel = to_relative(str(path), db_dir)
+
+    store = VectorStore(db_dir)
+    store.delete_by_file(source_rel)
 
     parts = extract_text(path)
-    chunks = chunk_document(parts, path)
+    chunks = chunk_document(parts, source_rel)
     file_hash = compute_file_hash(path)
 
     if chunks:

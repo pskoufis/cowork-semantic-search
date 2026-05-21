@@ -142,6 +142,50 @@ def test_indexing_second_folder_preserves_first(mock_get_model, tmp_path):
 
 
 @patch("server.indexer.get_model")
+def test_index_survives_relocation(mock_get_model, tmp_path):
+    """Moving the index + corpus to a new absolute path does not re-index."""
+    import shutil
+
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    # Lay out the index and corpus as siblings on one "drive".
+    root_a = tmp_path / "drive_a"
+    corpus_a = root_a / "corpus"
+    corpus_a.mkdir(parents=True)
+    db_a = root_a / "lancedb"
+    (corpus_a / "readme.md").write_text("# Revenue\n\nQ3 revenue grew 23%.")
+    (corpus_a / "notes.txt").write_text("Meeting notes about revenue.")
+    (corpus_a / "sub").mkdir()
+    (corpus_a / "sub" / "deep.txt").write_text("Nested revenue details.")
+
+    r1 = index_folder(str(corpus_a), db_path=str(db_a))
+    assert r1["files_indexed"] == 3
+
+    # Simulate re-plugging the drive at a different absolute mount point.
+    root_b = tmp_path / "drive_b_other_mount"
+    shutil.move(str(root_a), str(root_b))
+    corpus_b = root_b / "corpus"
+    db_b = root_b / "lancedb"
+
+    r2 = index_folder(str(corpus_b), db_path=str(db_b))
+    assert r2["files_indexed"] == 0      # nothing re-indexed
+    assert r2["files_skipped"] == 3      # all skipped via hash match
+    assert r2["files_deleted"] == 0      # no false orphans
+
+    from server.search import semantic_search
+    with patch("server.search.get_model", return_value=mock_model):
+        res = semantic_search("revenue", db_path=str(db_b))
+        hybrid = semantic_search("revenue", db_path=str(db_b), mode="hybrid")
+
+    assert res["total_results"] > 0
+    assert hybrid["total_results"] > 0
+    # Displayed paths resolve to the new location, for both search modes.
+    assert all(str(corpus_b) in r["source_file"] for r in res["results"])
+    assert all(str(corpus_b) in r["source_file"] for r in hybrid["results"])
+
+
+@patch("server.indexer.get_model")
 def test_index_folder_nonexistent_raises(mock_get_model, tmp_path):
     mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
     mock_get_model.return_value = mock_model
