@@ -11,3 +11,6 @@ build/
 lancedb/
 .lancedb/
 test-docs/
+
+# Local MCP config with machine-specific paths — copy from .mcp.json.example
+.mcp.json
