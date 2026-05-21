@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from server.indexer import discover_files, compute_file_hash, index_folder, EXCLUDE_PATTERNS
+from server.store import VectorStore
 
 
 @pytest.fixture
@@ -117,6 +118,27 @@ def test_index_folder_detects_deleted_files(mock_get_model, docs_dir, tmp_path):
     (docs_dir / "notes.txt").unlink()
     r2 = index_folder(str(docs_dir), db_path=db_path)
     assert r2["files_deleted"] == 1
+
+
+@patch("server.indexer.get_model")
+def test_indexing_second_folder_preserves_first(mock_get_model, tmp_path):
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    db_path = str(tmp_path / "testdb")
+    folder_a = tmp_path / "folder_a"
+    folder_a.mkdir()
+    folder_b = tmp_path / "folder_b"
+    folder_b.mkdir()
+    (folder_a / "a.txt").write_text("Alpha content about revenue.")
+    (folder_b / "b.txt").write_text("Beta content about expenses.")
+
+    index_folder(str(folder_a), db_path=db_path)
+    index_folder(str(folder_b), db_path=db_path)  # must NOT wipe folder A
+
+    files = VectorStore(db_path).get_all_files()
+    assert any("a.txt" in f for f in files)
+    assert any("b.txt" in f for f in files)
 
 
 @patch("server.indexer.get_model")

@@ -104,10 +104,15 @@ def index_folder(
             failed += 1
             errors.append({"file": str(file_path), "error": str(e)})
 
-    # Clean up chunks from deleted files
-    indexed_files = store.get_all_files()
-    for f in indexed_files:
-        if f not in current_files:
+    # Clean up chunks for files deleted from within this folder only
+    folder_resolved = folder.resolve()
+    for f in store.get_all_files():
+        fp = Path(f).resolve()
+        in_scope = (
+            fp.is_relative_to(folder_resolved) if recursive
+            else fp.parent == folder_resolved
+        )
+        if in_scope and f not in current_files:
             store.delete_by_file(f)
             deleted += 1
 
