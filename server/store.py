@@ -229,7 +229,7 @@ class VectorStore:
     def fts_search(
         self,
         query_text: str,
-        top_k: int = 10,
+        top_k: int = 25,
         folder_path: str | None = None,
         file_type: str | None = None,
     ) -> list[dict]:
@@ -270,7 +270,7 @@ class VectorStore:
         self,
         query_text: str,
         query_vector: list[float],
-        top_k: int = 10,
+        top_k: int = 25,
         folder_path: str | None = None,
         file_type: str | None = None,
         rrf_k: int = 60,
@@ -309,7 +309,7 @@ class VectorStore:
     def vector_search(
         self,
         query_vector: list[float],
-        top_k: int = 10,
+        top_k: int = 25,
         folder_path: str | None = None,
         file_type: str | None = None,
     ) -> list[dict]:

@@ -11,7 +11,7 @@ def semantic_search(
     query: str,
     db_path: str | None = None,
     folder_path: str | None = None,
-    top_k: int = 10,
+    top_k: int = 25,
     file_type: str | None = None,
     mode: str = "vector",
 ) -> dict:

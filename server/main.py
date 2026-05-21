@@ -140,8 +140,8 @@ def semantic_search(
     ] = None,
     top_k: Annotated[
         int,
-        Field(description="Number of results to return", default=10, ge=1, le=50),
-    ] = 10,
+        Field(description="Number of results to return (1–100)", default=25, ge=1, le=100),
+    ] = 25,
     file_type: Annotated[
         str | None,
         Field(
