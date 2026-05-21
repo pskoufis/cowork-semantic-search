@@ -10,6 +10,7 @@ build/
 .DS_Store
 lancedb/
 .lancedb/
+*.jobs.json*
 test-docs/
 
 # Local MCP config with machine-specific paths — copy from .mcp.json.example

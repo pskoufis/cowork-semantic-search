@@ -11,6 +11,7 @@ from server.indexer import (
     compute_file_hash,
     index_folder,
     _finalize_index,
+    _select_device,
     EXCLUDE_PATTERNS,
 )
 from server.store import VectorStore
@@ -438,3 +439,101 @@ def test_index_folder_migrates_pre_tier2_index(tmp_path):
         r2 = index_folder(str(corpus), db_path=db_path)
     assert r2["files_skipped"] == 2
     assert spy2.call_count == 0
+
+
+# -- Tier 3: per-file size cap (item 4.8) ------------------------------------
+
+@patch("server.indexer.get_model")
+def test_index_folder_skips_oversized_files(mock_get_model, tmp_path, monkeypatch):
+    """A file over MAX_FILE_SIZE_BYTES is skipped, reported, and not indexed."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+    monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 1024)
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "small.txt").write_text("a normal small document about revenue")
+    (corpus / "huge.txt").write_text("x" * 300_000)  # ~0.3 MB, over the 1 KB cap
+
+    db_path = str(tmp_path / "db")
+    result = index_folder(str(corpus), db_path=db_path)
+
+    assert result["files_indexed"] == 1
+    assert result["files_size_skipped"] == 1
+    assert len(result["oversized_files"]) == 1
+    assert result["oversized_files"][0]["file"].endswith("huge.txt")
+    assert result["oversized_files"][0]["size_mb"] > 0
+
+    # The oversized file produced no chunks; the small one did.
+    files = VectorStore(db_path).get_all_files()
+    assert any("small.txt" in f for f in files)
+    assert not any("huge.txt" in f for f in files)
+
+
+@patch("server.indexer.get_model")
+def test_oversized_growth_removes_stale_chunks(mock_get_model, tmp_path, monkeypatch):
+    """A file indexed while small, then grown past the cap, has its stale chunks
+    removed — and is not double-counted as an orphan deletion."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    target = corpus / "doc.txt"
+    target.write_text("small document about revenue")
+    db_path = str(tmp_path / "db")
+
+    r1 = index_folder(str(corpus), db_path=db_path)
+    assert r1["files_indexed"] == 1
+    assert VectorStore(db_path).count_chunks() > 0
+
+    # The file grows past a now-tiny cap.
+    target.write_text("x" * 5000)
+    monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 1024)
+    r2 = index_folder(str(corpus), db_path=db_path)
+
+    assert r2["files_size_skipped"] == 1
+    assert r2["files_deleted"] == 0  # not also counted as an orphan
+    assert VectorStore(db_path).count_chunks() == 0  # stale chunks gone
+
+
+@patch("server.indexer.get_model")
+def test_size_cap_disabled_indexes_everything(mock_get_model, tmp_path, monkeypatch):
+    """MAX_FILE_SIZE_BYTES of 0 disables the cap — large files index normally."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+    monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 0)
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "big.txt").write_text("revenue " * 5000)
+
+    result = index_folder(str(corpus), db_path=str(tmp_path / "db"))
+    assert result["files_indexed"] == 1
+    assert result["files_size_skipped"] == 0
+
+
+# -- Tier 3: embedding device selection (item 4.10) --------------------------
+
+def test_select_device_prefers_mps_when_available():
+    """_select_device picks MPS when the Apple-Silicon backend reports ready."""
+    import torch
+
+    if getattr(torch.backends, "mps", None) is None:
+        pytest.skip("this torch build has no mps backend")
+    with patch.object(torch.backends.mps, "is_available", return_value=True):
+        assert _select_device() == "mps"
+
+
+def test_select_device_falls_back_to_cpu_without_accelerator():
+    """With neither MPS nor CUDA available, _select_device returns cpu."""
+    import torch
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(torch.cuda, "is_available", return_value=False))
+        if getattr(torch.backends, "mps", None) is not None:
+            stack.enter_context(
+                patch.object(torch.backends.mps, "is_available", return_value=False)
+            )
+        assert _select_device() == "cpu"

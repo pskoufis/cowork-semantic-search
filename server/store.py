@@ -1,5 +1,6 @@
 """LanceDB vector store abstraction."""
 
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -101,6 +102,19 @@ class VectorStore:
         if table is None:
             return 0
         return table.count_rows()
+
+    def db_size_bytes(self) -> int:
+        """Total size on disk of the LanceDB directory — chunk text, vectors,
+        FTS/ANN indexes and version history. This can exceed the source corpus.
+        Returns 0 if the directory does not exist yet."""
+        total = 0
+        for root, _dirs, files in os.walk(self._db_path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass  # a file vanished mid-walk (compaction) — skip it
+        return total
 
     def get_file_hash(self, source_file: str) -> str | None:
         table = self._get_table()
