@@ -1,7 +1,9 @@
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
 from server.indexer import (
@@ -253,40 +255,186 @@ def test_index_folder_returns_finalize_warnings(mock_get_model, docs_dir, tmp_pa
     assert result["finalize_warnings"] == []
 
 
-def test_finalize_index_skips_when_table_unchanged(tmp_path):
-    """When nothing changed, the ANN index is not rebuilt."""
-    store = VectorStore(str(tmp_path / "db"))
+def _spy_finalize_steps(store):
+    """Replace the three finalize steps on a store with recorders."""
     called = []
-    store.create_vector_index = lambda: called.append(True)
+    store.optimize_table = lambda: called.append("optimize")
+    store.create_vector_index = lambda: called.append("vector")
+    store.create_fts_index = lambda: called.append("fts")
+    return called
 
-    warnings = _finalize_index(store, table_changed=False)
+
+def test_finalize_index_does_nothing_when_unchanged(tmp_path):
+    """No content and no stat change → no compaction, no index build."""
+    store = VectorStore(str(tmp_path / "db"))
+    called = _spy_finalize_steps(store)
+
+    warnings = _finalize_index(store, content_changed=False, stats_changed=False)
 
     assert warnings == []
     assert called == []
 
 
-def test_finalize_index_builds_vector_index_when_changed(tmp_path):
-    """When the table changed, the finalize step builds the ANN index."""
+def test_finalize_index_content_change_compacts_and_builds_indexes(tmp_path):
+    """A content change compacts, then rebuilds the vector and FTS indexes."""
     store = VectorStore(str(tmp_path / "db"))
-    called = []
-    store.create_vector_index = lambda: called.append(True)
+    called = _spy_finalize_steps(store)
 
-    warnings = _finalize_index(store, table_changed=True)
+    warnings = _finalize_index(store, content_changed=True, stats_changed=False)
 
-    assert called == [True]
     assert warnings == []
+    assert called == ["optimize", "vector", "fts"]
 
 
-def test_finalize_index_captures_build_failure_as_warning(tmp_path):
-    """An ANN build error becomes a warning — it never fails the indexing run."""
+def test_finalize_index_stats_only_compacts(tmp_path):
+    """A pure stat refresh (e.g. drive move) compacts but does not rebuild indexes."""
     store = VectorStore(str(tmp_path / "db"))
+    called = _spy_finalize_steps(store)
+
+    _finalize_index(store, content_changed=False, stats_changed=True)
+
+    assert called == ["optimize"]
+
+
+def test_finalize_index_captures_step_failure_as_warning(tmp_path):
+    """A failing finalize step becomes a warning — it never fails the run."""
+    store = VectorStore(str(tmp_path / "db"))
+    store.optimize_table = lambda: None
+    store.create_fts_index = lambda: None
 
     def boom():
         raise RuntimeError("disk full")
 
     store.create_vector_index = boom
 
-    warnings = _finalize_index(store, table_changed=True)
+    warnings = _finalize_index(store, content_changed=True, stats_changed=False)
 
     assert len(warnings) == 1
     assert "disk full" in warnings[0]
+
+
+@patch("server.indexer.get_model")
+def test_unchanged_rerun_skips_hashing(mock_get_model, docs_dir, tmp_path):
+    """A re-run over unchanged files takes the mtime/size fast path — no hashing."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+    db_path = str(tmp_path / "db")
+
+    index_folder(str(docs_dir), db_path=db_path)  # first run hashes everything
+
+    with patch("server.indexer.compute_file_hash", wraps=compute_file_hash) as spy:
+        result = index_folder(str(docs_dir), db_path=db_path)
+
+    assert result["files_skipped"] == 4
+    assert result["files_indexed"] == 0
+    assert spy.call_count == 0  # mtime + size matched; no file was read or hashed
+
+
+@patch("server.indexer.get_model")
+def test_touched_file_uses_hash_fallback_then_fastpaths(mock_get_model, docs_dir, tmp_path):
+    """A file touched (new mtime, same content) is hash-checked once, then its
+    stored stat is refreshed so the next run fast-paths it."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+    db_path = str(tmp_path / "db")
+
+    index_folder(str(docs_dir), db_path=db_path)
+
+    target = docs_dir / "readme.md"
+    st = target.stat()
+    os.utime(target, ns=(st.st_atime_ns + 10**9, st.st_mtime_ns + 10**9))
+
+    with patch("server.indexer.compute_file_hash", wraps=compute_file_hash) as spy:
+        r2 = index_folder(str(docs_dir), db_path=db_path)
+    assert r2["files_indexed"] == 0
+    assert r2["files_skipped"] == 4
+    assert spy.call_count == 1  # only the touched file was hashed
+
+    with patch("server.indexer.compute_file_hash", wraps=compute_file_hash) as spy3:
+        r3 = index_folder(str(docs_dir), db_path=db_path)
+    assert r3["files_skipped"] == 4
+    assert spy3.call_count == 0  # stat was refreshed — fast path again
+
+
+@patch("server.indexer.get_model")
+def test_content_change_triggers_reindex(mock_get_model, docs_dir, tmp_path):
+    """Changed file content is re-indexed; unchanged siblings are skipped."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+    db_path = str(tmp_path / "db")
+
+    index_folder(str(docs_dir), db_path=db_path)
+    (docs_dir / "readme.md").write_text("# Completely different content now")
+
+    r2 = index_folder(str(docs_dir), db_path=db_path)
+    assert r2["files_indexed"] == 1
+    assert r2["files_skipped"] == 3
+
+
+@patch("server.indexer.get_model")
+def test_batched_writes_persist_all_chunks(mock_get_model, tmp_path, monkeypatch):
+    """Buffered writes flushed across the threshold persist every chunk."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+    monkeypatch.setattr("server.indexer.FLUSH_CHUNK_THRESHOLD", 3)
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(10):
+        (corpus / f"f{i}.txt").write_text(f"content of file number {i}")
+
+    db_path = str(tmp_path / "db")
+    result = index_folder(str(corpus), db_path=db_path)
+
+    assert result["files_indexed"] == 10
+    assert result["total_chunks"] >= 10
+    assert VectorStore(db_path).count_chunks() == result["total_chunks"]
+
+
+def test_index_folder_migrates_pre_tier2_index(tmp_path):
+    """A pre-Tier-2 index (old schema, no mtime/size) migrates in place: the
+    first run hash-confirms each file unchanged and backfills its stat, and the
+    next run takes the pure fast path."""
+    import lancedb
+    from server.store import SCHEMA, TABLE_NAME
+    from server.paths import to_relative
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.txt").write_text("Alpha content about revenue.")
+    (corpus / "b.txt").write_text("Beta content about expenses.")
+    db_path = str(tmp_path / "db")
+
+    # Hand-build a pre-Tier-2 index: old schema, real content hashes, no stats.
+    old_schema = pa.schema(
+        [f for f in SCHEMA if f.name not in ("mtime_ns", "file_size")]
+    )
+    rows = []
+    for f in (corpus / "a.txt", corpus / "b.txt"):
+        rel = to_relative(str(f), db_path)
+        rows.append({
+            "id": f"{rel}_0",
+            "text": f.read_text(),
+            "source_file": rel,
+            "file_name": f.name,
+            "file_type": ".txt",
+            "folder_path": ".",
+            "chunk_index": 0,
+            "content_hash": compute_file_hash(f),
+            "vector": [0.0] * 384,
+        })
+    lancedb.connect(db_path).create_table(TABLE_NAME, data=rows, schema=old_schema)
+
+    # First post-upgrade run: stat columns are NULL, so each file is hashed
+    # once, confirmed unchanged, and its stat backfilled.
+    with patch("server.indexer.compute_file_hash", wraps=compute_file_hash) as spy1:
+        r1 = index_folder(str(corpus), db_path=db_path)
+    assert r1["files_indexed"] == 0
+    assert r1["files_skipped"] == 2
+    assert spy1.call_count == 2
+
+    # Second run: stats are backfilled — pure fast path, nothing hashed.
+    with patch("server.indexer.compute_file_hash", wraps=compute_file_hash) as spy2:
+        r2 = index_folder(str(corpus), db_path=db_path)
+    assert r2["files_skipped"] == 2
+    assert spy2.call_count == 0

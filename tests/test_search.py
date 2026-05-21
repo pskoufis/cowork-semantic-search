@@ -36,6 +36,8 @@ def _seed_store(store: VectorStore, texts: list[str], source_file: str = "corpus
             "folder_path": folder_path,
             "chunk_index": i,
             "content_hash": "fakehash",
+            "mtime_ns": 0,
+            "file_size": 0,
             "vector": vec.tolist(),
         })
     store.add_chunks(chunks)
@@ -106,8 +108,26 @@ def test_semantic_search_hybrid_mode(mock_get_model, tmp_path):
         "python is a programming language",
         "the weather is nice today",
     ])
+    store.create_fts_index()  # built at index time, mirroring the indexer
 
     result = semantic_search("revenue Q3", db_path=db_path, top_k=2, mode="hybrid")
     assert result["total_results"] >= 1
     assert result["mode"] == "hybrid"
     assert "score" in result["results"][0]
+
+
+@patch("server.search.get_model")
+def test_hybrid_search_does_not_rebuild_fts_index(mock_get_model, tmp_path):
+    """Hybrid search no longer rebuilds the FTS index per query — it is built
+    once at index time (4.7)."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    db_path = str(tmp_path / "testdb")
+    store = VectorStore(db_path)
+    _seed_store(store, ["revenue grew 23% in Q3", "python", "the weather"])
+    store.create_fts_index()
+
+    with patch.object(VectorStore, "create_fts_index") as fts_spy:
+        semantic_search("revenue", db_path=db_path, mode="hybrid")
+    fts_spy.assert_not_called()

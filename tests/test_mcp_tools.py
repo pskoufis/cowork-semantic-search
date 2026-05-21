@@ -272,3 +272,50 @@ async def test_mcp_reindex_file_rejects_while_job_running(mock_model, docs_dir, 
         )
         data = json.loads(result.content[0].text)
         assert data["status"] == "rejected"
+
+
+@pytest.mark.anyio
+async def test_mcp_reindex_file_records_stat_for_fastpath(mock_model, docs_dir, tmp_path):
+    """reindex_file stores mtime/size, so a later index_folder fast-paths the file."""
+    db_path = str(tmp_path / "testdb")
+    from server.indexer import index_folder as _index_folder
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "reindex_file",
+            {"file_path": str(docs_dir / "readme.md"), "db_path": db_path},
+        )
+        assert not result.is_error
+
+    # readme.md was indexed via reindex_file; index_folder must now skip it
+    # (its stat was stored) and only index the never-seen notes.txt.
+    outcome = _index_folder(str(docs_dir), db_path=db_path)
+    assert outcome["files_skipped"] == 1
+    assert outcome["files_indexed"] == 1
+
+
+@pytest.mark.anyio
+async def test_mcp_get_index_status_on_pre_tier2_index(tmp_path):
+    """get_index_status (a read path) works on an un-migrated old-schema index."""
+    import lancedb
+    import pyarrow as pa
+    from server.store import SCHEMA, TABLE_NAME
+
+    db_path = str(tmp_path / "db")
+    old_schema = pa.schema(
+        [f for f in SCHEMA if f.name not in ("mtime_ns", "file_size")]
+    )
+    row = {
+        "id": "x_0", "text": "hello", "source_file": "corpus/x.txt",
+        "file_name": "x.txt", "file_type": ".txt", "folder_path": "corpus",
+        "chunk_index": 0, "content_hash": "h", "vector": [0.0] * 384,
+    }
+    lancedb.connect(db_path).create_table(TABLE_NAME, data=[row], schema=old_schema)
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_index_status", {"db_path": db_path})
+        data = json.loads(result.content[0].text)
+
+    assert data["total_chunks"] == 1
+    assert data["total_files"] == 1
+    assert data["jobs"] == {"active": [], "recent": []}
