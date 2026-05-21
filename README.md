@@ -49,6 +49,7 @@ Your documents --> chunked --> embedded --> local vector DB
 | Word | `.docx` | Full paragraph extraction |
 | PowerPoint | `.pptx` | Slide-level extraction with metadata |
 | CSV | `.csv` | Row-based text extraction |
+| Outlook archive | `.pst` | One part per mail message, with attachment text |
 
 ## Quick Start
 
@@ -60,6 +61,12 @@ cd cowork-semantic-search
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[all]"
 ```
+
+> **PST support compiles a C extension.** The `pst` extra — included in
+> `all` — installs `libpff-python`, which has no Apple-Silicon wheel and
+> builds from source, so the Xcode command-line tools
+> (`xcode-select --install`) must be present. To skip it, install
+> `pip install -e ".[pdf,docx,pptx]"` instead.
 
 ### 2. Configure your MCP client
 
@@ -279,6 +286,7 @@ server/
 | PDF | PyMuPDF | Fast, accurate extraction |
 | DOCX | python-docx | Lightweight, no system deps |
 | PPTX | python-pptx | Slide-level extraction |
+| PST | libpff (pypff) | Streams Outlook archives without reading them whole |
 
 ## Development
 

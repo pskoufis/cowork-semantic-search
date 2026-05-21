@@ -27,6 +27,24 @@ except ValueError:
     _MAX_FILE_SIZE_MB = 100
 MAX_FILE_SIZE_BYTES = _MAX_FILE_SIZE_MB * 1024 * 1024 if _MAX_FILE_SIZE_MB > 0 else 0
 
+# Formats whose parser streams the file from disk instead of reading it whole,
+# so the size cap above must not apply. pypff reads a .pst incrementally; real
+# Outlook archives are routinely multi-GB and the cap would skip them all.
+# (OOM protection for .pst moves to a per-attachment guard inside the parser.)
+STREAMING_EXTENSIONS = {".pst"}
+
+
+def exceeds_size_cap(file_path: Path, size: int) -> bool:
+    """True when a file is too large to parse safely.
+
+    Always False when the cap is disabled or the format streams from disk."""
+    if not MAX_FILE_SIZE_BYTES:
+        return False
+    if file_path.suffix.lower() in STREAMING_EXTENSIONS:
+        return False
+    return size > MAX_FILE_SIZE_BYTES
+
+
 _model = None
 
 
@@ -170,8 +188,8 @@ def index_folder(
             # Size cap: skip a file too large to parse without risking an OOM.
             # delete_by_file clears stale chunks if it was indexed while smaller;
             # the file stays in current_files so orphan-cleanup does not also
-            # count it as deleted.
-            if MAX_FILE_SIZE_BYTES and size > MAX_FILE_SIZE_BYTES:
+            # count it as deleted. Streaming formats (.pst) are exempt.
+            if exceeds_size_cap(file_path, size):
                 store.delete_by_file(source_rel)
                 size_skipped += 1
                 oversized_files.append({

@@ -16,10 +16,14 @@ dependencies = [
 pdf = ["pymupdf>=1.25,<2.0"]
 docx = ["python-docx>=1.1,<2.0"]
 pptx = ["python-pptx>=1.0,<2.0"]
+# libpff-python has no Apple-Silicon wheel and compiles from source — the
+# Xcode command-line tools are required to install this extra.
+pst = ["libpff-python>=20231205"]
 all = [
     "pymupdf>=1.25,<2.0",
     "python-docx>=1.1,<2.0",
     "python-pptx>=1.0,<2.0",
+    "libpff-python>=20231205",
 ]
 dev = ["pytest>=8.0"]
 
