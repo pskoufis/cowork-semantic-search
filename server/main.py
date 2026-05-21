@@ -263,16 +263,20 @@ def reindex_file(
     source_rel = to_relative(str(path), db_dir)
 
     store = VectorStore(db_dir)
+    store.ensure_schema()  # migrate a pre-Tier-2 index in place, if needed
     store.delete_by_file(source_rel)
 
     parts = extract_text(path)
     chunks = chunk_document(parts, source_rel)
     file_hash = compute_file_hash(path)
+    stat = path.stat()
 
     if chunks:
         chunks = embed_chunks(chunks)
         for c in chunks:
             c["content_hash"] = file_hash
+            c["mtime_ns"] = stat.st_mtime_ns
+            c["file_size"] = stat.st_size
         store.add_chunks(chunks)
 
     return {

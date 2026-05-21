@@ -1,7 +1,22 @@
+import lancedb
 import numpy as np
+import pyarrow as pa
 import pytest
 
-from server.store import VectorStore
+from server.store import VectorStore, TABLE_NAME
+
+# Pre-Tier-2 schema (no mtime_ns / file_size) — used to test in-place migration.
+OLD_SCHEMA = pa.schema([
+    pa.field("id", pa.string()),
+    pa.field("text", pa.string()),
+    pa.field("source_file", pa.string()),
+    pa.field("file_name", pa.string()),
+    pa.field("file_type", pa.string()),
+    pa.field("folder_path", pa.string()),
+    pa.field("chunk_index", pa.int32()),
+    pa.field("content_hash", pa.string()),
+    pa.field("vector", pa.list_(pa.float32(), 384)),
+])
 
 
 @pytest.fixture
@@ -9,7 +24,13 @@ def store(tmp_path):
     return VectorStore(str(tmp_path / "testdb"))
 
 
-def _make_chunks(texts: list[str], source_file: str = "/fake/doc.txt", file_hash: str = "abc123"):
+def _make_chunks(
+    texts: list[str],
+    source_file: str = "/fake/doc.txt",
+    file_hash: str = "abc123",
+    mtime_ns: int = 1000,
+    file_size: int = 500,
+):
     """Helper to create chunk dicts with random embeddings."""
     chunks = []
     for i, text in enumerate(texts):
@@ -25,6 +46,8 @@ def _make_chunks(texts: list[str], source_file: str = "/fake/doc.txt", file_hash
             "folder_path": "/fake",
             "chunk_index": i,
             "content_hash": file_hash,
+            "mtime_ns": mtime_ns,
+            "file_size": file_size,
             "vector": vec.tolist(),
         })
     return chunks
@@ -177,6 +200,8 @@ def _random_chunks(n: int) -> list[dict]:
             "folder_path": "/fake",
             "chunk_index": 0,
             "content_hash": "h",
+            "mtime_ns": i,
+            "file_size": i,
             "vector": vec.tolist(),
         })
     return chunks
@@ -212,3 +237,101 @@ def test_create_vector_index_refresh_is_idempotent(store, monkeypatch):
     store.create_vector_index()
     store.create_vector_index()
     assert len(store._get_table().list_indices()) == 1
+
+
+# --- Tier 2: schema, bulk reads, stat refresh, compaction ---
+
+
+def test_schema_has_stat_fields():
+    """The schema carries mtime_ns and file_size for the cheap change-check."""
+    from server.store import SCHEMA
+    assert "mtime_ns" in SCHEMA.names
+    assert "file_size" in SCHEMA.names
+
+
+def test_ensure_schema_migrates_pre_tier2_table(tmp_path):
+    """ensure_schema adds the new columns to a table created without them."""
+    db_path = str(tmp_path / "db")
+    db = lancedb.connect(db_path)
+    db.create_table(TABLE_NAME, schema=OLD_SCHEMA)  # pre-Tier-2 index
+
+    store = VectorStore(db_path)
+    store.ensure_schema()
+
+    names = store._get_table().schema.names
+    assert "mtime_ns" in names
+    assert "file_size" in names
+
+
+def test_ensure_schema_noop_when_columns_present(store):
+    """ensure_schema is a harmless no-op on an already-current table."""
+    store.add_chunks(_make_chunks(["x"]))
+    store.ensure_schema()
+    assert "mtime_ns" in store._get_table().schema.names
+
+
+def test_ensure_schema_no_table_is_safe(store):
+    """ensure_schema on a fresh DB with no table must not raise."""
+    store.ensure_schema()
+    assert store.count_chunks() == 0
+
+
+def test_get_file_index_returns_stat_and_hash(store):
+    store.add_chunks(_make_chunks(
+        ["a", "b"], source_file="/f/x.txt",
+        file_hash="h1", mtime_ns=111, file_size=222,
+    ))
+    idx = store.get_file_index()
+    assert idx == {
+        "/f/x.txt": {"content_hash": "h1", "mtime_ns": 111, "file_size": 222},
+    }
+
+
+def test_get_file_index_empty_store(store):
+    assert store.get_file_index() == {}
+
+
+def test_get_file_index_multiple_files(store):
+    a = _make_chunks(["a"], source_file="/f/a.txt", file_hash="ha", mtime_ns=1, file_size=10)
+    b = _make_chunks(["b"], source_file="/f/b.txt", file_hash="hb", mtime_ns=2, file_size=20)
+    b[0]["id"] = "chunk_b_0"
+    store.add_chunks(a)
+    store.add_chunks(b)
+    idx = store.get_file_index()
+    assert set(idx) == {"/f/a.txt", "/f/b.txt"}
+    assert idx["/f/b.txt"] == {"content_hash": "hb", "mtime_ns": 2, "file_size": 20}
+
+
+def test_update_file_stat(store):
+    store.add_chunks(_make_chunks(
+        ["a", "b"], source_file="/f/x.txt", mtime_ns=1, file_size=1,
+    ))
+    store.update_file_stat("/f/x.txt", mtime_ns=999, file_size=888)
+    idx = store.get_file_index()
+    assert idx["/f/x.txt"]["mtime_ns"] == 999
+    assert idx["/f/x.txt"]["file_size"] == 888
+
+
+def test_optimize_table_runs(store):
+    store.add_chunks(_make_chunks(["a", "b"]))
+    store.optimize_table()
+    assert store.count_chunks() == 2
+
+
+def test_optimize_table_empty_store_is_safe(store):
+    store.optimize_table()
+    assert store.count_chunks() == 0
+
+
+def test_add_chunks_persists_stat_fields(store):
+    """add_chunks writes mtime_ns/file_size through to the table."""
+    store.add_chunks(_make_chunks(["a"], mtime_ns=12345, file_size=678))
+    rows = (
+        store._get_table()
+        .search()
+        .select(["mtime_ns", "file_size"])
+        .limit(1)
+        .to_list()
+    )
+    assert rows[0]["mtime_ns"] == 12345
+    assert rows[0]["file_size"] == 678

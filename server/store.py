@@ -1,5 +1,6 @@
 """LanceDB vector store abstraction."""
 
+from datetime import timedelta
 from pathlib import Path
 
 import lancedb
@@ -14,6 +15,10 @@ SCHEMA = pa.schema([
     pa.field("folder_path", pa.string()),
     pa.field("chunk_index", pa.int32()),
     pa.field("content_hash", pa.string()),
+    # st_mtime_ns + st_size — a cheap stat pre-check that avoids re-hashing
+    # unchanged files. int64 (not float st_mtime) for exact equality.
+    pa.field("mtime_ns", pa.int64()),
+    pa.field("file_size", pa.int64()),
     pa.field("vector", pa.list_(pa.float32(), 384)),
 ])
 
@@ -50,6 +55,28 @@ class VectorStore:
             self._table = self._db.create_table(TABLE_NAME, schema=SCHEMA)
         return self._table
 
+    def ensure_schema(self) -> None:
+        """Migrate a pre-Tier-2 index in place by adding any missing columns.
+
+        Adds mtime_ns / file_size (backfilled NULL) to a table that predates
+        them. Idempotent. Called only on write paths; the single-writer
+        invariant guarantees no two callers race this migration.
+        """
+        table = self._get_table()
+        if table is None:
+            return  # fresh DB: _ensure_table creates with the current SCHEMA
+        existing = set(table.schema.names)
+        missing = [
+            field for field in (
+                pa.field("mtime_ns", pa.int64()),
+                pa.field("file_size", pa.int64()),
+            )
+            if field.name not in existing
+        ]
+        if missing:
+            table.add_columns(missing)
+            self._table = self._db.open_table(TABLE_NAME)  # refresh stale handle
+
     def add_chunks(self, chunks: list[dict]) -> None:
         table = self._ensure_table()
         rows = []
@@ -63,6 +90,8 @@ class VectorStore:
                 "folder_path": c["folder_path"],
                 "chunk_index": c["chunk_index"],
                 "content_hash": c["content_hash"],
+                "mtime_ns": c["mtime_ns"],
+                "file_size": c["file_size"],
                 "vector": c["vector"],
             })
         table.add(rows)
@@ -88,18 +117,59 @@ class VectorStore:
             return results[0]["content_hash"]
         return None
 
+    def get_file_index(self) -> dict[str, dict]:
+        """Bulk-load {source_file: {content_hash, mtime_ns, file_size}} in one
+        projected scan — replaces a per-file get_file_hash query during indexing.
+        """
+        table = self._get_table()
+        if table is None:
+            return {}
+        n = table.count_rows()
+        if n == 0:
+            return {}
+        # Projected scan: select() reads only these columns, not the vectors.
+        rows = (
+            table.search()
+            .select(["source_file", "content_hash", "mtime_ns", "file_size"])
+            .limit(n)
+            .to_list()
+        )
+        index: dict[str, dict] = {}
+        for r in rows:
+            index[r["source_file"]] = {
+                "content_hash": r["content_hash"],
+                "mtime_ns": r["mtime_ns"],
+                "file_size": r["file_size"],
+            }
+        return index
+
     def delete_by_file(self, source_file: str) -> None:
         table = self._get_table()
         if table is None:
             return
         table.delete(f"source_file = '{_escape(source_file)}'")
 
+    def update_file_stat(self, source_file: str, mtime_ns: int, file_size: int) -> None:
+        """Refresh the stored mtime/size for a file whose content is unchanged
+        (e.g. after a drive move) so later runs hit the cheap fast-path."""
+        table = self._get_table()
+        if table is None:
+            return
+        table.update(
+            where=f"source_file = '{_escape(source_file)}'",
+            values={"mtime_ns": mtime_ns, "file_size": file_size},
+        )
+
     def get_all_files(self) -> list[str]:
         table = self._get_table()
         if table is None:
             return []
-        arrow_table = table.to_arrow().select(["source_file"])
-        return list(set(arrow_table.column("source_file").to_pylist()))
+        n = table.count_rows()
+        if n == 0:
+            return []
+        # Projected scan: select() reads only source_file, never the vectors.
+        rows = table.search().select(["source_file"]).limit(n).to_list()
+        return list({r["source_file"] for r in rows})
 
     def create_fts_index(self) -> None:
         """Create or rebuild the full-text search index on the text column."""
@@ -107,6 +177,17 @@ class VectorStore:
         if table is None:
             return
         table.create_fts_index("text", replace=True)
+
+    def optimize_table(self) -> None:
+        """Compact small fragments and drop superseded versions.
+
+        cleanup_older_than=0 removes all old versions immediately; safe because
+        the single-writer invariant guarantees exclusive write access.
+        """
+        table = self._get_table()
+        if table is None:
+            return
+        table.optimize(cleanup_older_than=timedelta(seconds=0))
 
     def create_vector_index(self) -> None:
         """Build (or rebuild) an IVF_PQ ANN index on the vector column.

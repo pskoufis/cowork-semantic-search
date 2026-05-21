@@ -31,7 +31,7 @@ def semantic_search(
     )
 
     if mode == "hybrid":
-        store.create_fts_index()
+        # The FTS index is built at index time (_finalize_index), not per query.
         results = store.hybrid_search(
             query_text=query,
             query_vector=query_embedding,
