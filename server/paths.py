@@ -15,6 +15,12 @@ def _db_dir(db_path: str) -> str:
     return os.path.abspath(db_path)
 
 
+def default_db_dir() -> str:
+    """The LanceDB directory the server uses when no db_path is given:
+    the LANCEDB_PATH env var, or ./lancedb, normalized to an absolute path."""
+    return os.path.abspath(os.environ.get("LANCEDB_PATH", "./lancedb"))
+
+
 def to_relative(abs_path: str, db_path: str, check_volume: bool = True) -> str:
     """Convert an absolute path to one relative to the LanceDB directory.
 

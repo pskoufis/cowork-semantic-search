@@ -14,10 +14,14 @@ from server.main import mcp
 
 @pytest.fixture(autouse=True)
 def clean_registry():
-    """Isolate the process-wide job registry between tests."""
+    """Isolate the process-wide job registry between tests, and stop it writing
+    its persistence file during the run."""
     registry._jobs.clear()
     registry._order.clear()
+    saved_persist = registry._persist_path
+    registry._persist_path = None
     yield
+    registry._persist_path = saved_persist
     registry._jobs.clear()
     registry._order.clear()
 
@@ -292,6 +296,54 @@ async def test_mcp_reindex_file_records_stat_for_fastpath(mock_model, docs_dir, 
     outcome = _index_folder(str(docs_dir), db_path=db_path)
     assert outcome["files_skipped"] == 1
     assert outcome["files_indexed"] == 1
+
+
+@pytest.mark.anyio
+async def test_mcp_get_index_status_reports_db_size(mock_model, docs_dir, tmp_path):
+    """get_index_status reports the index size on disk after indexing."""
+    db_path = str(tmp_path / "testdb")
+    from server.indexer import index_folder as _index_folder
+    _index_folder(str(docs_dir), db_path=db_path)
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_index_status", {"db_path": db_path})
+        data = json.loads(result.content[0].text)
+
+    assert "db_size_bytes" in data
+    assert "db_size" in data
+    assert data["db_size_bytes"] > 0  # a populated index occupies disk
+    assert isinstance(data["db_size"], str)
+
+
+@pytest.mark.anyio
+async def test_mcp_get_index_status_db_size_zero_when_empty(tmp_path):
+    """db_size is present and zero for a nonexistent index."""
+    db_path = str(tmp_path / "emptydb")
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_index_status", {"db_path": db_path})
+        data = json.loads(result.content[0].text)
+
+    assert data["db_size_bytes"] == 0
+    assert data["db_size"] == "0 B"
+
+
+@pytest.mark.anyio
+async def test_mcp_reindex_file_skips_oversized(mock_model, tmp_path, monkeypatch):
+    """reindex_file refuses a file over the size cap and leaves the index alone."""
+    monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 1024)
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 5000)
+    db_path = str(tmp_path / "db")
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "reindex_file", {"file_path": str(big), "db_path": db_path}
+        )
+        data = json.loads(result.content[0].text)
+
+    assert data["status"] == "skipped"
+    assert data["chunks_created"] == 0
+    assert "cap" in data["reason"]
 
 
 @pytest.mark.anyio

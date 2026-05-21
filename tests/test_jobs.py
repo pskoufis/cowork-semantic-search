@@ -117,3 +117,66 @@ def test_to_dict_omits_task_handle(registry):
     assert "task" not in d
     assert d["job_id"] == job.job_id
     assert d["state"] == "running"
+
+
+# -- Tier 3: persistence across server restarts (item 4.9) -------------------
+
+def test_no_persistence_without_a_path():
+    """With persist_path=None the registry is purely in-memory."""
+    reg = JobRegistry()
+    assert reg._persist_path is None
+    job = reg.create("/corpus", "/db")  # must not raise
+    assert reg.get(job.job_id) is job
+
+
+def test_persisted_jobs_reload_in_a_fresh_registry(tmp_path):
+    """A completed job written by one registry is read back by the next."""
+    path = str(tmp_path / "jobs.json")
+    reg = JobRegistry(persist_path=path)
+    job = reg.create("/corpus", "/db")
+    reg.mark_completed(job.job_id, {"files_indexed": 7}, ["a warning"])
+
+    reloaded = JobRegistry(persist_path=path)
+    got = reloaded.get(job.job_id)
+    assert got is not None
+    assert got.state == "completed"
+    assert got.result == {"files_indexed": 7}
+    assert got.finalize_warnings == ["a warning"]
+
+
+def test_running_job_loads_as_interrupted(tmp_path):
+    """A job still 'running' on disk belonged to a process that is now gone —
+    it loads as 'interrupted'."""
+    path = str(tmp_path / "jobs.json")
+    reg = JobRegistry(persist_path=path)
+    job = reg.create("/corpus", "/db")  # left running, as if the process died
+
+    reloaded = JobRegistry(persist_path=path)
+    got = reloaded.get(job.job_id)
+    assert got.state == "interrupted"
+    assert got.finished_at is not None
+    assert got.error and "interrupted" in got.error
+    # An interrupted job is finished: not running, shows up in recent().
+    assert reloaded.has_running() is False
+    assert [j.job_id for j in reloaded.recent()] == [job.job_id]
+    assert reloaded.active() == []
+
+
+def test_corrupt_jobs_file_yields_empty_registry(tmp_path):
+    """A corrupt persistence file does not crash construction."""
+    path = tmp_path / "jobs.json"
+    path.write_text("{ this is not valid json")
+    reg = JobRegistry(persist_path=str(path))
+    assert reg.recent() == []
+    assert reg.active() == []
+
+
+def test_save_replaces_atomically_leaving_no_temp_file(tmp_path):
+    """After a save the persistence file exists and no temp file lingers."""
+    path = tmp_path / "jobs.json"
+    reg = JobRegistry(persist_path=str(path))
+    reg.create("/corpus", "/db")
+
+    assert path.exists()
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "jobs.json"]
+    assert leftovers == []

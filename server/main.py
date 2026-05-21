@@ -10,6 +10,15 @@ from pydantic import Field
 mcp = FastMCP("Semantic Search")
 
 
+def _human_size(num_bytes: int) -> str:
+    """Format a byte count as a short human-readable string, e.g. '4.2 GB'."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
 async def _run_index_job(job, file_types, recursive) -> None:
     """Run the synchronous index_folder in a worker thread, recording progress
     and the final outcome on the job record.
@@ -78,8 +87,12 @@ async def index_folder(
     Indexing runs in the background: this call returns immediately with a
     job_id. Poll get_index_status to follow progress and read the final result.
     Only one indexing job runs at a time — a call made while another job is
-    running is rejected. Job state is in-memory and does not survive a server
-    restart (re-running is cheap: unchanged files are skipped).
+    running is rejected. Job records are persisted next to the index, so a run
+    interrupted by a server restart shows up afterwards as 'interrupted';
+    simply re-run to recover (unchanged files are skipped, so it is cheap).
+
+    Files larger than the MAX_FILE_SIZE_MB cap (default 100 MB) are skipped and
+    reported in the result's oversized_files list rather than indexed.
     """
     from server.jobs import registry
 
@@ -178,9 +191,11 @@ def get_index_status(
 ) -> dict:
     """Get status of the search index and any background indexing jobs.
 
-    Returns total chunks and the list of indexed files, plus a `jobs` section
-    with active and recently-finished indexing jobs — poll this to follow an
-    index_folder run. Job state is in-memory and resets on server restart.
+    Returns total chunks, the list of indexed files, and the index size on disk
+    (`db_size_bytes` / `db_size`), plus a `jobs` section with active and
+    recently-finished indexing jobs — poll this to follow an index_folder run.
+    Job records are persisted next to the index; a run cut short by a server
+    restart appears here as 'interrupted'.
     """
     from server.store import VectorStore
     from server.paths import to_absolute
@@ -190,16 +205,25 @@ def get_index_status(
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
     db_dir = os.path.abspath(db_path)
 
-    stats = {"total_chunks": 0, "total_files": 0, "indexed_files": []}
+    stats = {
+        "total_chunks": 0,
+        "total_files": 0,
+        "indexed_files": [],
+        "db_size_bytes": 0,
+        "db_size": "0 B",
+    }
     try:
         store = VectorStore(db_dir)
         indexed_files = sorted(
             to_absolute(f, db_dir) for f in store.get_all_files()
         )
+        size_bytes = store.db_size_bytes()
         stats = {
             "total_chunks": store.count_chunks(),
             "total_files": len(indexed_files),
             "indexed_files": indexed_files,
+            "db_size_bytes": size_bytes,
+            "db_size": _human_size(size_bytes),
         }
     except Exception:
         pass  # status must stay readable even if the DB is missing or busy
@@ -233,7 +257,9 @@ def reindex_file(
     has changed or when parsing was updated.
 
     Rejected while a background index_folder job is running, to keep a single
-    writer on the index — retry once that job finishes.
+    writer on the index — retry once that job finishes. A file over the
+    MAX_FILE_SIZE_MB cap (default 100 MB) is returned with status 'skipped' and
+    the index is left untouched.
     """
     from server.jobs import registry
 
@@ -248,13 +274,27 @@ def reindex_file(
     from pathlib import Path
     from server.parsers import extract_text
     from server.chunker import chunk_document
-    from server.indexer import embed_chunks, compute_file_hash
+    from server.indexer import embed_chunks, compute_file_hash, MAX_FILE_SIZE_BYTES
     from server.store import VectorStore
     from server.paths import to_relative
 
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
+
+    stat = path.stat()
+    if MAX_FILE_SIZE_BYTES and stat.st_size > MAX_FILE_SIZE_BYTES:
+        # Too large to parse without risking an OOM; leave the index untouched.
+        return {
+            "status": "skipped",
+            "file_path": file_path,
+            "reason": (
+                f"file is {stat.st_size / 1024 / 1024:.1f} MB, over the "
+                f"{MAX_FILE_SIZE_BYTES // 1024 // 1024} MB indexing cap "
+                f"(set via the MAX_FILE_SIZE_MB env var)"
+            ),
+            "chunks_created": 0,
+        }
 
     if db_path is None:
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
@@ -269,7 +309,6 @@ def reindex_file(
     parts = extract_text(path)
     chunks = chunk_document(parts, source_rel)
     file_hash = compute_file_hash(path)
-    stat = path.stat()
 
     if chunks:
         chunks = embed_chunks(chunks)

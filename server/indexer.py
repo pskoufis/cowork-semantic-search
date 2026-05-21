@@ -17,14 +17,42 @@ BATCH_SIZE = 64
 # buffer reaches this size, instead of a tiny write per file.
 FLUSH_CHUNK_THRESHOLD = 1000
 
+# Per-file size cap. Files larger than this are skipped instead of indexed, so
+# one multi-GB file cannot OOM the server — every parser reads the whole file
+# into memory (a CSV transiently holds ~3x its size). Override via the
+# MAX_FILE_SIZE_MB env var; set it to 0 to disable the cap entirely.
+try:
+    _MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "100"))
+except ValueError:
+    _MAX_FILE_SIZE_MB = 100
+MAX_FILE_SIZE_BYTES = _MAX_FILE_SIZE_MB * 1024 * 1024 if _MAX_FILE_SIZE_MB > 0 else 0
+
 _model = None
+
+
+def _select_device() -> str:
+    """Pick the best embedding device available: Apple-Silicon MPS, then CUDA,
+    else CPU. Defensive about torch builds that lack the mps backend."""
+    try:
+        import torch
+    except Exception:
+        return "cpu"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 def get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        _model = SentenceTransformer(
+            "paraphrase-multilingual-MiniLM-L12-v2",
+            device=_select_device(),
+        )
     return _model
 
 
@@ -118,7 +146,9 @@ def index_folder(
 
     start = time.time()
     indexed, skipped, deleted, failed, stats_refreshed = 0, 0, 0, 0, 0
+    size_skipped = 0
     errors = []
+    oversized_files = []  # files skipped for exceeding MAX_FILE_SIZE_BYTES
     current_files = set()  # paths relative to the index directory
     buffer: list[dict] = []  # chunks awaiting a batched write
 
@@ -136,6 +166,20 @@ def index_folder(
         try:
             st = file_path.stat()
             mtime_ns, size = st.st_mtime_ns, st.st_size
+
+            # Size cap: skip a file too large to parse without risking an OOM.
+            # delete_by_file clears stale chunks if it was indexed while smaller;
+            # the file stays in current_files so orphan-cleanup does not also
+            # count it as deleted.
+            if MAX_FILE_SIZE_BYTES and size > MAX_FILE_SIZE_BYTES:
+                store.delete_by_file(source_rel)
+                size_skipped += 1
+                oversized_files.append({
+                    "file": str(file_path),
+                    "size_mb": round(size / 1024 / 1024, 1),
+                })
+                continue
+
             record = file_index.get(source_rel)
 
             # Fast path: stat unchanged -> file unchanged. No read, no hash.
@@ -212,8 +256,10 @@ def index_folder(
         "files_skipped": skipped,
         "files_deleted": deleted,
         "files_failed": failed,
+        "files_size_skipped": size_skipped,
         "total_chunks": store.count_chunks(),
         "errors": errors,
+        "oversized_files": oversized_files,
         "finalize_warnings": finalize_warnings,
         "duration_seconds": round(time.time() - start, 2),
     }

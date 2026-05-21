@@ -178,7 +178,7 @@ Works the same with PDFs, Word docs, PowerPoints, and CSVs -- just point it at a
 |------|-------------|
 | `index_folder` | Index or re-index all documents in a folder. Incremental -- skips unchanged files. |
 | `semantic_search` | Search indexed documents using natural language. Supports `vector` and `hybrid` modes. |
-| `get_index_status` | Show total chunks, file count, and list of indexed files. |
+| `get_index_status` | Show total chunks, file count, indexed files, index size on disk, and background-job history. |
 | `reindex_file` | Force re-index a single file, bypassing the hash cache. |
 
 ## How It Works
@@ -217,6 +217,23 @@ Notes:
 - The index directory and **all** indexed folders must be on the same volume.
 - Mount points differ per machine, so set `LANCEDB_PATH` to wherever the drive mounts on each Mac (e.g. `/Volumes/MyDrive` vs `/Volumes/MyDrive-1`).
 - Use an **absolute** path -- the `./lancedb` default is relative to the working directory and is not portable.
+
+</details>
+
+<details>
+<summary><strong>Indexing large folders & disk usage</strong></summary>
+
+Indexing scales to large corpora (tens of GB, hundreds of thousands of files). A few things worth knowing:
+
+- **Disk capacity.** The index stores each chunk's text plus a 384-dimensional vector, alongside full-text and ANN indexes. Expect the index directory to be **roughly the size of -- or larger than -- the source corpus**. Make sure the volume holding `LANCEDB_PATH` has headroom. Compaction runs automatically after every indexing run, so old versions and fragments don't pile up. `get_index_status` reports the current index size on disk (`db_size`).
+
+- **Large files.** Files above a size cap (default **100 MB**) are skipped rather than indexed, so a single huge file cannot exhaust memory -- every parser loads the whole file. Skipped files are reported in the `index_folder` result under `oversized_files`. Change the cap with the `MAX_FILE_SIZE_MB` environment variable (set it to `0` to disable the cap):
+
+  ```json
+  "env": { "MAX_FILE_SIZE_MB": "250" }
+  ```
+
+- **Interrupted runs.** Indexing runs in the background and can take a long time on a large corpus. Job records are saved next to the index, so if the server is restarted mid-run, `get_index_status` reports that job as `interrupted`. There is no separate resume step -- just run `index_folder` again. Unchanged files are detected by a fast modification-time check and skipped, so re-running after an interruption is cheap.
 
 </details>
 
@@ -270,7 +287,7 @@ source .venv/bin/activate
 pytest tests/ -v
 ```
 
-68 tests covering parsers, chunking, indexing, search, path portability, and MCP tool integration.
+131 tests covering parsers, chunking, indexing, search, path portability, background indexing jobs, and MCP tool integration.
 
 Contributions welcome -- open an issue or submit a PR.
 
