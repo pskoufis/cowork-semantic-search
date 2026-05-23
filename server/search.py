@@ -22,7 +22,12 @@ def semantic_search(
     store = VectorStore(db_dir)
 
     model = get_model()
-    query_embedding = model.encode([query], normalize_embeddings=True)[0].tolist()
+    # Qwen3-Embedding ships a built-in "query" prompt for retrieval — wraps the
+    # query in an "Instruct: ... Query: ..." template and yields a 1–5% lift
+    # vs encoding plain. Documents are still encoded without a prompt.
+    query_embedding = model.encode(
+        [query], normalize_embeddings=True, prompt_name="query",
+    )[0].tolist()
 
     # The caller passes an absolute folder path; the store holds relative paths.
     folder_filter = (

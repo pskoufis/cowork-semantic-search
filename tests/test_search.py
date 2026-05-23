@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from server.search import semantic_search
-from server.store import VectorStore
+from server.store import VectorStore, EMBEDDING_DIM
 from server.paths import to_absolute
 
 
@@ -13,7 +13,7 @@ def _fake_embed(texts):
     results = []
     for t in texts:
         rng = np.random.RandomState(hash(t) % 2**32)
-        vec = rng.randn(384).astype(np.float32)
+        vec = rng.randn(EMBEDDING_DIM).astype(np.float32)
         vec = vec / np.linalg.norm(vec)
         results.append(vec)
     return np.array(results)

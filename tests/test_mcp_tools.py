@@ -10,6 +10,7 @@ from fastmcp import Client
 
 from server.jobs import registry
 from server.main import mcp
+from server.store import EMBEDDING_DIM
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +49,7 @@ def _fake_embed(texts):
     results = []
     for t in texts:
         rng = np.random.RandomState(hash(t) % 2**32)
-        vec = rng.randn(384).astype(np.float32)
+        vec = rng.randn(EMBEDDING_DIM).astype(np.float32)
         vec = vec / np.linalg.norm(vec)
         results.append(vec)
     return np.array(results)
@@ -360,7 +361,7 @@ async def test_mcp_get_index_status_on_pre_tier2_index(tmp_path):
     row = {
         "id": "x_0", "text": "hello", "source_file": "corpus/x.txt",
         "file_name": "x.txt", "file_type": ".txt", "folder_path": "corpus",
-        "chunk_index": 0, "content_hash": "h", "vector": [0.0] * 384,
+        "chunk_index": 0, "content_hash": "h", "vector": [0.0] * EMBEDDING_DIM,
     }
     lancedb.connect(db_path).create_table(TABLE_NAME, data=[row], schema=old_schema)
 

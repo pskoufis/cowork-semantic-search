@@ -45,6 +45,11 @@ def exceeds_size_cap(file_path: Path, size: int) -> bool:
     return size > MAX_FILE_SIZE_BYTES
 
 
+# Qwen3-Embedding-0.6B: 1024-dim native, MRL-supported. We truncate to
+# EMBEDDING_DIM (from store.py — currently 256) via Matryoshka — the head
+# dimensions are first-class, not a naive slice.
+EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+
 _model = None
 
 
@@ -67,10 +72,24 @@ def get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
+        from server.store import EMBEDDING_DIM
         _model = SentenceTransformer(
-            "paraphrase-multilingual-MiniLM-L12-v2",
+            EMBEDDING_MODEL,
             device=_select_device(),
+            # Matryoshka — sentence-transformers truncates *and* L2-renormalises.
+            truncate_dim=EMBEDDING_DIM,
+            # Qwen3 uses last-token pooling on a decoder; right-padding would
+            # make the pooled token a PAD for shorter sequences in a batch and
+            # silently corrupt embeddings.
+            tokenizer_kwargs={"padding_side": "left"},
         )
+        # Fail loudly at load if the model upload ever drops the "query" prompt
+        # we rely on in search.py — better than dying on first user query.
+        if "query" not in getattr(_model, "prompts", {}):
+            raise RuntimeError(
+                f"{EMBEDDING_MODEL} did not expose a 'query' prompt; "
+                "server/search.py relies on it. Check the model card / upload."
+            )
     return _model
 
 

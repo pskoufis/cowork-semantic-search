@@ -7,6 +7,11 @@ from pathlib import Path
 import lancedb
 import pyarrow as pa
 
+# Single source of truth for the embedding dimension. Lives in store.py (not
+# indexer.py) because the schema's FixedSizeList width must match it, and
+# indexer.py already imports from this module — putting it here avoids a cycle.
+EMBEDDING_DIM = 256
+
 SCHEMA = pa.schema([
     pa.field("id", pa.string()),
     pa.field("text", pa.string()),
@@ -20,7 +25,7 @@ SCHEMA = pa.schema([
     # unchanged files. int64 (not float st_mtime) for exact equality.
     pa.field("mtime_ns", pa.int64()),
     pa.field("file_size", pa.int64()),
-    pa.field("vector", pa.list_(pa.float32(), 384)),
+    pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
 ])
 
 TABLE_NAME = "chunks"
@@ -48,6 +53,7 @@ class VectorStore:
                 self._table = self._db.open_table(TABLE_NAME)
             except Exception:
                 return None
+            self._check_dim_compat(self._table)
         return self._table
 
     def _ensure_table(self):
@@ -55,6 +61,25 @@ class VectorStore:
         if table is None:
             self._table = self._db.create_table(TABLE_NAME, schema=SCHEMA)
         return self._table
+
+    def _check_dim_compat(self, table) -> None:
+        """Fail fast when the on-disk vector dim doesn't match the embedding
+        model in use. A 256-dim add()/search() against a 384-dim table would
+        otherwise die with a cryptic Arrow error somewhere downstream — this
+        gives the user a clear next step instead.
+        """
+        try:
+            vector_field = table.schema.field("vector")
+            stored_dim = vector_field.type.list_size
+        except Exception:
+            return  # nothing we can do; let the underlying error surface
+        if stored_dim != EMBEDDING_DIM:
+            raise RuntimeError(
+                f"Index at {self._db_path!r} has {stored_dim}-dim vectors, "
+                f"but the current embedding model produces {EMBEDDING_DIM}-dim "
+                f"vectors. The model changed since this index was built. "
+                f"Delete {self._db_path!r} and re-index."
+            )
 
     def ensure_schema(self) -> None:
         """Migrate a pre-Tier-2 index in place by adding any missing columns.
@@ -222,7 +247,7 @@ class VectorStore:
             vector_column_name="vector",
             index_type="IVF_PQ",
             num_partitions=max(1, n // 4096),
-            num_sub_vectors=48,  # embedding dimension 384 / 8
+            num_sub_vectors=EMBEDDING_DIM // 8,  # IVF_PQ subspace count; 8 floats per sub-vector
             replace=True,
         )
 
