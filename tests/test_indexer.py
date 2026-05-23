@@ -14,7 +14,7 @@ from server.indexer import (
     _select_device,
     EXCLUDE_PATTERNS,
 )
-from server.store import VectorStore
+from server.store import VectorStore, EMBEDDING_DIM
 
 
 @pytest.fixture
@@ -77,7 +77,7 @@ def _fake_embed(texts):
     results = []
     for t in texts:
         rng = np.random.RandomState(hash(t) % 2**32)
-        vec = rng.randn(384).astype(np.float32)
+        vec = rng.randn(EMBEDDING_DIM).astype(np.float32)
         vec = vec / np.linalg.norm(vec)
         results.append(vec)
     return np.array(results)
@@ -422,7 +422,7 @@ def test_index_folder_migrates_pre_tier2_index(tmp_path):
             "folder_path": ".",
             "chunk_index": 0,
             "content_hash": compute_file_hash(f),
-            "vector": [0.0] * 384,
+            "vector": [0.0] * EMBEDDING_DIM,
         })
     lancedb.connect(db_path).create_table(TABLE_NAME, data=rows, schema=old_schema)
 

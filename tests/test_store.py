@@ -3,9 +3,11 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from server.store import VectorStore, TABLE_NAME
+from server.store import VectorStore, TABLE_NAME, EMBEDDING_DIM
 
 # Pre-Tier-2 schema (no mtime_ns / file_size) — used to test in-place migration.
+# Uses the current EMBEDDING_DIM, not a historical one, so the migration test
+# stays focused on the column-add path instead of also tripping the dim guard.
 OLD_SCHEMA = pa.schema([
     pa.field("id", pa.string()),
     pa.field("text", pa.string()),
@@ -15,7 +17,7 @@ OLD_SCHEMA = pa.schema([
     pa.field("folder_path", pa.string()),
     pa.field("chunk_index", pa.int32()),
     pa.field("content_hash", pa.string()),
-    pa.field("vector", pa.list_(pa.float32(), 384)),
+    pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
 ])
 
 
@@ -35,7 +37,7 @@ def _make_chunks(
     chunks = []
     for i, text in enumerate(texts):
         rng = np.random.RandomState(hash(text) % 2**32)
-        vec = rng.randn(384).astype(np.float32)
+        vec = rng.randn(EMBEDDING_DIM).astype(np.float32)
         vec = vec / np.linalg.norm(vec)
         chunks.append({
             "id": f"chunk_{i}",
@@ -108,7 +110,7 @@ def test_vector_search(store):
 
 
 def test_vector_search_empty_store(store):
-    results = store.vector_search([0.0] * 384, top_k=5)
+    results = store.vector_search([0.0] * EMBEDDING_DIM, top_k=5)
     assert results == []
 
 
@@ -189,7 +191,7 @@ def _random_chunks(n: int) -> list[dict]:
     chunks = []
     for i in range(n):
         rng = np.random.RandomState(i)
-        vec = rng.randn(384).astype(np.float32)
+        vec = rng.randn(EMBEDDING_DIM).astype(np.float32)
         vec = vec / np.linalg.norm(vec)
         chunks.append({
             "id": f"c_{i}",
@@ -274,6 +276,25 @@ def test_ensure_schema_no_table_is_safe(store):
     """ensure_schema on a fresh DB with no table must not raise."""
     store.ensure_schema()
     assert store.count_chunks() == 0
+
+
+def test_open_index_with_mismatched_vector_dim_raises(tmp_path):
+    """The dim guard exists so a user upgrading the embedding model gets a
+    clear 'delete and re-index' message instead of a cryptic Arrow error.
+    Create a table whose vector field is intentionally a non-current dim and
+    confirm opening it via VectorStore raises with both dims in the message."""
+    db_path = str(tmp_path / "db")
+    wrong_dim = 999
+    assert wrong_dim != EMBEDDING_DIM
+    wrong_schema = pa.schema(
+        [f for f in OLD_SCHEMA if f.name != "vector"]
+        + [pa.field("vector", pa.list_(pa.float32(), wrong_dim))]
+    )
+    lancedb.connect(db_path).create_table(TABLE_NAME, schema=wrong_schema)
+
+    store = VectorStore(db_path)
+    with pytest.raises(RuntimeError, match=f"{wrong_dim}-dim"):
+        store._get_table()
 
 
 def test_get_file_index_returns_stat_and_hash(store):

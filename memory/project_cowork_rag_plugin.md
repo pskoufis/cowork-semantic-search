@@ -8,6 +8,8 @@ Claude Code plugin for local semantic search over document folders. Fully offlin
 
 **Phase 1 MVP (completed 2026-03-24):** Plugin scaffolding, FastMCP server with `index_folder` + `semantic_search` tools, .txt/.md parsing, RecursiveCharacterTextSplitter chunking, paraphrase-multilingual-MiniLM-L12-v2 embeddings (lazy-loaded), LanceDB vector store, SHA-256 incremental indexing.
 
+**Embedding model swap (v0.2.0, 2026-05-23):** Replaced paraphrase-multilingual-MiniLM-L12-v2 (384-dim) with `Qwen/Qwen3-Embedding-0.6B` truncated to 256-dim via Matryoshka. Uses `prompt_name="query"` for query encoding, `padding_side="left"` (last-token pooling on a decoder). Schema vector field + IVF_PQ `num_sub_vectors` derive from `EMBEDDING_DIM` in `server/store.py`. Breaking change for existing indexes — dim guard in `VectorStore._get_table` tells users to delete `LANCEDB_PATH` and re-index. Requires `transformers>=4.51.0`. Why: better retrieval quality + 33% smaller vectors on disk; user works mostly on Mac so the larger model's MPS slowdown is acceptable. How to apply: tests stub `get_model`; never depend on the model running in CI.
+
 **Phase 2 (completed 2026-03-24):** PDF/DOCX/PPTX/CSV parsers (pymupdf, python-docx, python-pptx, stdlib csv), hybrid search (FTS + vector via manual RRF — LanceDB native hybrid requires registered embedding fn), `get_index_status` and `reindex_file` MCP tools, `mode` param on `semantic_search` (vector|hybrid). 56 passing tests. README, LICENSE, .mcp.json for local dev configured.
 
 **Phase 3 (next):**

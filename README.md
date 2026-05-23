@@ -192,7 +192,7 @@ Works the same with PDFs, Word docs, PowerPoints, and CSVs -- just point it at a
 
 1. **Parse** -- extract text from each document, preserving structure (pages, slides)
 2. **Chunk** -- split into ~400 character overlapping pieces for precise retrieval
-3. **Embed** -- convert each chunk into a 384-dimensional vector using `paraphrase-multilingual-MiniLM-L12-v2`
+3. **Embed** -- convert each chunk into a 256-dimensional vector using `Qwen/Qwen3-Embedding-0.6B` with Matryoshka truncation (the model is trained with MRL, so the head 256 dims are first-class — not a naive slice). First indexing run downloads ~1.2 GB of model weights from Hugging Face.
 4. **Store** -- save chunks + vectors in a LanceDB database (a local file, no server needed)
 5. **Search** -- embed your query, find nearest chunks by cosine similarity, optionally combine with full-text keyword search via RRF
 
@@ -232,7 +232,7 @@ Notes:
 
 Indexing scales to large corpora (tens of GB, hundreds of thousands of files). A few things worth knowing:
 
-- **Disk capacity.** The index stores each chunk's text plus a 384-dimensional vector, alongside full-text and ANN indexes. Expect the index directory to be **roughly the size of -- or larger than -- the source corpus**. Make sure the volume holding `LANCEDB_PATH` has headroom. Compaction runs automatically after every indexing run, so old versions and fragments don't pile up. `get_index_status` reports the current index size on disk (`db_size`).
+- **Disk capacity.** The index stores each chunk's text plus a 256-dimensional vector, alongside full-text and ANN indexes. Expect the index directory to be **roughly the size of -- or larger than -- the source corpus**. Make sure the volume holding `LANCEDB_PATH` has headroom. Compaction runs automatically after every indexing run, so old versions and fragments don't pile up. `get_index_status` reports the current index size on disk (`db_size`).
 
 - **Large files.** Files above a size cap (default **100 MB**) are skipped rather than indexed, so a single huge file cannot exhaust memory -- every parser loads the whole file. Skipped files are reported in the `index_folder` result under `oversized_files`. Change the cap with the `MAX_FILE_SIZE_MB` environment variable (set it to `0` to disable the cap):
 
