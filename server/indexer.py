@@ -8,10 +8,10 @@ from typing import Callable
 
 from server.parsers import extract_text, SUPPORTED_EXTENSIONS
 from server.chunker import chunk_document
+from server.exclusions import ExclusionRules
 from server.store import VectorStore
 from server.paths import to_relative, to_absolute
 
-EXCLUDE_PATTERNS = {"__pycache__", ".git", ".DS_Store", "node_modules", ".venv", "*.tmp"}
 BATCH_SIZE = 64
 # Chunks are buffered across files and written in one table.add() once the
 # buffer reaches this size, instead of a tiny write per file.
@@ -97,14 +97,37 @@ def discover_files(
     folder_path: Path,
     file_types: set[str] | None,
     recursive: bool,
+    exclusions: ExclusionRules | None = None,
 ) -> list[Path]:
+    """Walk the folder and return files matching `file_types`.
+
+    When `exclusions` is set, directories matching an exclusion rule are
+    pruned from the walk (the walker never descends into them), and matched
+    files are filtered out.
+    """
     extensions = file_types or SUPPORTED_EXTENSIONS
-    pattern = "**/*" if recursive else "*"
-    files = []
-    for path in folder_path.glob(pattern):
-        if path.is_file() and path.suffix.lower() in extensions:
-            if not any(exc in path.parts for exc in EXCLUDE_PATTERNS):
-                files.append(path)
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(folder_path):
+        dpath = Path(dirpath)
+        if recursive:
+            if exclusions is not None:
+                # In-place mutation so os.walk skips the pruned dirs entirely;
+                # is_dir=True is required for directory-only patterns to match.
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not exclusions.is_excluded(dpath / d, folder_path, is_dir=True)
+                ]
+        else:
+            dirnames[:] = []
+        for name in filenames:
+            f = dpath / name
+            if f.suffix.lower() not in extensions:
+                continue
+            if exclusions is not None and exclusions.is_excluded(
+                f, folder_path, is_dir=False
+            ):
+                continue
+            files.append(f)
     return sorted(files)
 
 
@@ -163,6 +186,7 @@ def index_folder(
     recursive: bool = True,
     db_path: str | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    exclude: list[str] | None = None,
 ) -> dict:
     folder = Path(folder_path)
     if not folder.exists():
@@ -172,14 +196,45 @@ def index_folder(
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
     db_dir = os.path.abspath(db_path)
 
+    # Compile exclusion rules early — a bad pattern raises ValueError before
+    # any work is done. The MCP layer turns that into a `rejected` response.
+    exclusions = ExclusionRules.load(folder, extra_patterns=exclude, db_dir=db_dir)
+
     store = VectorStore(db_dir)
     store.ensure_schema()  # migrate a pre-Tier-2 index in place, if needed
     type_set = set(file_types) if file_types else None
-    files = discover_files(folder, type_set, recursive)
+    files = discover_files(folder, type_set, recursive, exclusions=exclusions)
     folder_resolved = folder.resolve()
     # One bulk load of {source_rel: {content_hash, mtime_ns, file_size}},
     # instead of a per-file change-detection query.
     file_index = store.get_file_index()
+
+    # Prune pass: drop chunks for already-indexed files *under this folder*
+    # that now match an exclusion rule. Scoped by in-scope check so an
+    # exclusion in folder B's run cannot wipe folder A's chunks. Runs before
+    # the main loop so the orphan-cleanup at the end does not also see these
+    # files and double-count them as deletions.
+    #
+    # `f_abs` from `to_absolute` is not resolved (it just normpaths join), so
+    # we resolve it here to match `folder_resolved` — otherwise macOS's
+    # `/var` → `/private/var` symlink makes every in_scope check fail.
+    files_excluded_pruned = 0
+    for f_rel in list(file_index.keys()):
+        f_abs_raw = Path(to_absolute(f_rel, db_dir))
+        try:
+            f_abs = f_abs_raw.resolve()
+        except OSError:
+            f_abs = f_abs_raw
+        in_scope = (
+            f_abs.is_relative_to(folder_resolved) if recursive
+            else f_abs.parent == folder_resolved
+        )
+        if not in_scope:
+            continue
+        if exclusions.is_excluded(f_abs, folder_resolved, is_dir=False):
+            store.delete_by_file(f_rel)
+            file_index.pop(f_rel, None)
+            files_excluded_pruned += 1
 
     start = time.time()
     indexed, skipped, deleted, failed, stats_refreshed = 0, 0, 0, 0, 0
@@ -269,13 +324,24 @@ def index_folder(
 
     # Clean up chunks for files deleted from within this folder only.
     # Stored paths are relative — resolve to absolute before the scope check.
+    # Skip excluded paths so the prune-pass count and this orphan count never
+    # claim the same file: an excluded file is already gone from the store by
+    # the time we reach here, but the guard makes the intent explicit.
     for f_rel in store.get_all_files():
-        f_abs = Path(to_absolute(f_rel, db_dir))
+        f_abs_raw = Path(to_absolute(f_rel, db_dir))
+        try:
+            f_abs = f_abs_raw.resolve()
+        except OSError:
+            f_abs = f_abs_raw
         in_scope = (
             f_abs.is_relative_to(folder_resolved) if recursive
             else f_abs.parent == folder_resolved
         )
-        if in_scope and f_rel not in current_files:
+        if not in_scope:
+            continue
+        if exclusions.is_excluded(f_abs, folder_resolved, is_dir=False):
+            continue
+        if f_rel not in current_files:
             store.delete_by_file(f_rel)
             deleted += 1
 
@@ -294,9 +360,11 @@ def index_folder(
         "files_deleted": deleted,
         "files_failed": failed,
         "files_size_skipped": size_skipped,
+        "files_excluded_pruned": files_excluded_pruned,
         "total_chunks": store.count_chunks(),
         "errors": errors,
         "oversized_files": oversized_files,
+        "exclusion_patterns": exclusions.patterns,
         "finalize_warnings": finalize_warnings,
         "duration_seconds": round(time.time() - start, 2),
     }

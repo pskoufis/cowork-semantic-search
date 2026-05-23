@@ -19,7 +19,7 @@ def _human_size(num_bytes: int) -> str:
         size /= 1024
 
 
-async def _run_index_job(job, file_types, recursive) -> None:
+async def _run_index_job(job, file_types, recursive, exclude) -> None:
     """Run the synchronous index_folder in a worker thread, recording progress
     and the final outcome on the job record.
 
@@ -41,6 +41,7 @@ async def _run_index_job(job, file_types, recursive) -> None:
             recursive,
             job.db_path,
             progress,
+            exclude,
         )
         registry.mark_completed(
             job.job_id, result, result.get("finalize_warnings", [])
@@ -77,6 +78,17 @@ async def index_folder(
             default=None,
         ),
     ] = None,
+    exclude: Annotated[
+        list[str] | None,
+        Field(
+            description="Optional list of gitignore-style patterns to exclude. "
+                        "Patterns are matched against paths relative to "
+                        "folder_path. Combined with any patterns in a "
+                        ".semanticignore file at folder_path's root. Examples: "
+                        "['node_modules/**', '*.log', '!keep.log'].",
+            default=None,
+        ),
+    ] = None,
 ) -> dict:
     """Start a background job to index or re-index all documents in a folder.
 
@@ -95,8 +107,17 @@ async def index_folder(
     Files larger than the MAX_FILE_SIZE_MB cap (default 100 MB) are skipped and
     reported in the result's oversized_files list rather than indexed; .pst
     archives stream from disk and are exempt from the cap.
+
+    Exclusion rules come from two sources, combined: a `.semanticignore` file
+    at folder_path's root (gitignore syntax), and the `exclude` parameter. On
+    a re-run, files that newly match a rule are pruned from the index and
+    counted in the result's `files_excluded_pruned`. A syntactically invalid
+    pattern is rejected up front with `reason: 'invalid_exclusion_pattern'`
+    — no job is started.
     """
     from server.jobs import registry
+    from server.exclusions import ExclusionRules
+    from pathlib import Path as _Path
 
     if not os.path.isdir(folder_path):
         raise FileNotFoundError(f"Folder not found: {folder_path}")
@@ -104,6 +125,19 @@ async def index_folder(
     if db_path is None:
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
     db_dir = os.path.abspath(db_path)
+
+    # Compile exclusions up front so a bad pattern is reported synchronously
+    # rather than as a delayed job failure. The same compile runs inside
+    # index_folder, but doing it twice is cheap and gives the user a clean
+    # rejection path.
+    try:
+        ExclusionRules.load(_Path(folder_path), extra_patterns=exclude, db_dir=db_dir)
+    except ValueError as e:
+        return {
+            "status": "rejected",
+            "reason": "invalid_exclusion_pattern",
+            "message": str(e),
+        }
 
     if registry.has_running():
         active = registry.active()
@@ -115,7 +149,9 @@ async def index_folder(
         }
 
     job = registry.create(folder_path, db_dir)
-    job.task = asyncio.create_task(_run_index_job(job, file_types, recursive))
+    job.task = asyncio.create_task(
+        _run_index_job(job, file_types, recursive, exclude)
+    )
     return {
         "status": "started",
         "job_id": job.job_id,
@@ -190,6 +226,16 @@ def get_index_status(
             default=None,
         ),
     ] = None,
+    folder_path: Annotated[
+        str | None,
+        Field(
+            description="Optional folder to report exclusion rules for. When "
+                        "supplied, the response includes an `exclusions` field "
+                        "describing the .semanticignore at that folder's root "
+                        "(or null when none exists). Omitted otherwise.",
+            default=None,
+        ),
+    ] = None,
 ) -> dict:
     """Get status of the search index and any background indexing jobs.
 
@@ -198,10 +244,18 @@ def get_index_status(
     recently-finished indexing jobs — poll this to follow an index_folder run.
     Job records are persisted next to the index; a run cut short by a server
     restart appears here as 'interrupted'.
+
+    When `folder_path` is supplied, the response also includes an `exclusions`
+    object describing the active .semanticignore at that folder (or `null` if
+    no file is present). The indexed-root is not persisted, so there's no
+    honest way to list all folders' exclusions in one call — pass the folder
+    you care about.
     """
     from server.store import VectorStore
     from server.paths import to_absolute
     from server.jobs import registry
+    from server.exclusions import ExclusionRules, SEMANTICIGNORE_FILENAME
+    from pathlib import Path as _Path
 
     if db_path is None:
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
@@ -230,13 +284,39 @@ def get_index_status(
     except Exception:
         pass  # status must stay readable even if the DB is missing or busy
 
-    return {
+    out: dict = {
         **stats,
         "jobs": {
             "active": [j.to_dict() for j in registry.active()],
             "recent": [j.to_dict() for j in registry.recent()],
         },
     }
+
+    if folder_path is not None:
+        folder = _Path(folder_path)
+        ignore_file = folder / SEMANTICIGNORE_FILENAME
+        if ignore_file.is_file():
+            try:
+                rules = ExclusionRules.load(
+                    folder, extra_patterns=None, db_dir=db_dir
+                )
+                out["exclusions"] = {
+                    "folder_path": str(folder),
+                    "semanticignore_path": str(ignore_file),
+                    "patterns": rules.patterns,
+                }
+            except ValueError as e:
+                # Surface the parse failure as the exclusions payload so the
+                # caller can see *why* their .semanticignore isn't working.
+                out["exclusions"] = {
+                    "folder_path": str(folder),
+                    "semanticignore_path": str(ignore_file),
+                    "error": str(e),
+                }
+        else:
+            out["exclusions"] = None
+
+    return out
 
 
 @mcp.tool(
@@ -262,6 +342,12 @@ def reindex_file(
     writer on the index — retry once that job finishes. A file over the
     MAX_FILE_SIZE_MB cap (default 100 MB) is returned with status 'skipped' and
     the index is left untouched; .pst archives are exempt from the cap.
+
+    Exclusion rules (.semanticignore / index_folder's `exclude` param) are
+    bypassed: reindex_file is an explicit per-file act and force-indexes the
+    requested file. The one hard rule that is NOT bypassed is the LanceDB
+    self-protection — a file inside the active index directory is rejected
+    with `reason: 'inside_index_dir'`.
     """
     from server.jobs import registry
 
@@ -286,6 +372,28 @@ def reindex_file(
     if not path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
 
+    if db_path is None:
+        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+    db_dir = os.path.abspath(db_path)
+
+    # Hard rule: a path inside the active LanceDB directory is never indexed —
+    # otherwise a stray call could try to parse the index's own files.
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    db_resolved = Path(db_dir).resolve() if Path(db_dir).exists() else Path(db_dir)
+    if resolved.is_relative_to(db_resolved):
+        return {
+            "status": "rejected",
+            "reason": "inside_index_dir",
+            "file_path": file_path,
+            "message": (
+                "file_path is inside the active LanceDB directory; "
+                "reindex_file refuses to parse the index's own files."
+            ),
+        }
+
     stat = path.stat()
     if exceeds_size_cap(path, stat.st_size):
         # Too large to parse without risking an OOM; leave the index untouched.
@@ -300,10 +408,6 @@ def reindex_file(
             ),
             "chunks_created": 0,
         }
-
-    if db_path is None:
-        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
-    db_dir = os.path.abspath(db_path)
 
     source_rel = to_relative(str(path), db_dir)
 
