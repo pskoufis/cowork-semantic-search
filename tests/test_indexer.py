@@ -12,8 +12,8 @@ from server.indexer import (
     index_folder,
     _finalize_index,
     _select_device,
-    EXCLUDE_PATTERNS,
 )
+from server.exclusions import ExclusionRules
 from server.store import VectorStore, EMBEDDING_DIM
 
 
@@ -38,10 +38,15 @@ def test_discover_files_finds_supported(docs_dir):
     assert "image.png" not in names
 
 
-def test_discover_files_excludes_patterns(docs_dir):
-    files = discover_files(docs_dir, file_types=None, recursive=True)
+def test_discover_files_excludes_via_exclusion_rules(docs_dir, tmp_path):
+    """Excluding a file via ExclusionRules keeps it out of the walk results."""
+    rules = ExclusionRules.load(
+        docs_dir, extra_patterns=["*.DS_Store"], db_dir=str(tmp_path / "db")
+    )
+    files = discover_files(docs_dir, file_types=None, recursive=True, exclusions=rules)
     names = {f.name for f in files}
     assert ".DS_Store" not in names
+    assert "readme.md" in names  # other files still discovered
 
 
 def test_discover_files_non_recursive(docs_dir):
@@ -564,3 +569,188 @@ def test_select_device_falls_back_to_cpu_without_accelerator():
                 patch.object(torch.backends.mps, "is_available", return_value=False)
             )
         assert _select_device() == "cpu"
+
+
+# -- Exclusion rules integration --------------------------------------------
+
+@patch("server.indexer.get_model")
+def test_index_folder_with_exclude_param_skips_matching_files(
+    mock_get_model, tmp_path
+):
+    """index_folder honours the `exclude` param. Uses `vendored/` so the test
+    doesn't accidentally rely on any default-list behaviour."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "keep.md").write_text("real content about revenue")
+    (corpus / "vendored").mkdir()
+    (corpus / "vendored" / "junk.md").write_text("vendored library README")
+
+    db_path = str(tmp_path / "db")
+    result = index_folder(str(corpus), db_path=db_path, exclude=["vendored/**"])
+
+    assert result["files_indexed"] == 1
+    files = VectorStore(db_path).get_all_files()
+    assert any("keep.md" in f for f in files)
+    assert not any("vendored" in f for f in files)
+    assert result["exclusion_patterns"] == ["vendored/**"]
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_honours_semanticignore_file(mock_get_model, tmp_path):
+    """A `.semanticignore` at the indexed root is honoured without a param."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / ".semanticignore").write_text("vendored/\n")
+    (corpus / "keep.md").write_text("real content about revenue")
+    (corpus / "vendored").mkdir()
+    (corpus / "vendored" / "junk.md").write_text("vendored library README")
+
+    db_path = str(tmp_path / "db")
+    result = index_folder(str(corpus), db_path=db_path)
+
+    assert result["files_indexed"] == 1
+    files = VectorStore(db_path).get_all_files()
+    assert not any("vendored" in f for f in files)
+
+
+def test_discover_files_prunes_excluded_dirs_without_reading(tmp_path):
+    """When a directory matches an exclusion rule, the walk does NOT descend.
+    Verified with a parser-call spy: a file deep inside an excluded dir is
+    never returned, so the parser is never invoked on it."""
+    corpus = tmp_path / "corpus"
+    nested = corpus / "vendored" / "deeply" / "buried"
+    nested.mkdir(parents=True)
+    (nested / "secret.md").write_text("should never be read")
+    (corpus / "keep.md").write_text("ok")
+
+    rules = ExclusionRules.load(
+        corpus, extra_patterns=["vendored/"], db_dir=str(tmp_path / "db")
+    )
+    files = discover_files(corpus, file_types=None, recursive=True, exclusions=rules)
+    names = {f.name for f in files}
+    assert "secret.md" not in names
+    assert "keep.md" in names
+    # No path under vendored/ should be returned at all.
+    assert not any("vendored" in str(f) for f in files)
+
+
+@patch("server.indexer.get_model")
+def test_rerun_with_new_exclusion_prunes_chunks(mock_get_model, tmp_path):
+    """A re-run after a new exclusion rule prunes the now-excluded chunks and
+    reports them in files_excluded_pruned. Uses `vendored/` to keep the test
+    hermetic — independent of any default-list state."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "keep.md").write_text("real content")
+    (corpus / "vendored").mkdir()
+    (corpus / "vendored" / "junk.md").write_text("vendored content")
+
+    db_path = str(tmp_path / "db")
+
+    # First run: no exclusions — both files indexed.
+    r1 = index_folder(str(corpus), db_path=db_path)
+    assert r1["files_indexed"] == 2
+    files_after_r1 = VectorStore(db_path).get_all_files()
+    assert any("vendored" in f for f in files_after_r1)
+
+    # Add an exclusion and re-run.
+    (corpus / ".semanticignore").write_text("vendored/\n")
+    r2 = index_folder(str(corpus), db_path=db_path)
+    assert r2["files_excluded_pruned"] >= 1
+    files_after_r2 = VectorStore(db_path).get_all_files()
+    assert not any("vendored" in f for f in files_after_r2)
+    # The now-excluded file was NOT counted as an orphan deletion.
+    assert r2["files_deleted"] == 0
+
+    # Third run: nothing newly excluded — files_excluded_pruned drops back to 0.
+    r3 = index_folder(str(corpus), db_path=db_path)
+    assert r3["files_excluded_pruned"] == 0
+
+
+@patch("server.indexer.get_model")
+def test_exclusion_in_folder_b_does_not_prune_folder_a(mock_get_model, tmp_path):
+    """A re-run of folder B with an exclusion rule must NOT prune folder A's
+    chunks, even when those chunks would also match the rule by path. The
+    prune pass must be scoped to the folder being indexed."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    db_path = str(tmp_path / "db")
+
+    folder_a = tmp_path / "folder_a"
+    folder_a.mkdir()
+    (folder_a / "keep_a.txt").write_text("folder A text content")
+
+    folder_b = tmp_path / "folder_b"
+    folder_b.mkdir()
+    (folder_b / "keep_b.md").write_text("folder B markdown content")
+    (folder_b / "drop_b.txt").write_text("folder B text content")
+
+    # Index both — no exclusions.
+    index_folder(str(folder_a), db_path=db_path)
+    index_folder(str(folder_b), db_path=db_path)
+
+    files = VectorStore(db_path).get_all_files()
+    assert any("keep_a.txt" in f for f in files)
+    assert any("drop_b.txt" in f for f in files)
+
+    # Re-index folder B only, excluding *.txt. Folder A's *.txt must survive.
+    index_folder(str(folder_b), db_path=db_path, exclude=["*.txt"])
+    files = VectorStore(db_path).get_all_files()
+    assert any("keep_a.txt" in f for f in files), \
+        "folder A's *.txt was wiped by folder B's exclusion rule"
+    assert not any("drop_b.txt" in f for f in files), \
+        "folder B's *.txt was not pruned"
+
+
+def test_index_folder_raises_on_invalid_pattern(tmp_path):
+    """An invalid exclusion pattern raises ValueError — the MCP layer turns
+    this into a `rejected` response. The index is never touched."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.md").write_text("content")
+
+    with pytest.raises(ValueError) as exc:
+        index_folder(str(corpus), db_path=str(tmp_path / "db"), exclude=["\\"])
+    assert "\\" in str(exc.value)
+
+
+@patch("server.indexer.get_model")
+def test_prune_works_when_folder_is_a_symlink(mock_get_model, tmp_path):
+    """Indexing through a symlink to the corpus must still prune correctly on
+    a re-run. The earlier bug was that f_abs from to_absolute wasn't resolved,
+    so the in_scope check failed (the symlinked folder_path resolves to a
+    different real path) and the prune pass silently did nothing."""
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    real = tmp_path / "real_corpus"
+    real.mkdir()
+    (real / "keep.md").write_text("real content")
+    (real / "vendored").mkdir()
+    (real / "vendored" / "junk.md").write_text("vendored content")
+
+    link = tmp_path / "linked_corpus"
+    link.symlink_to(real, target_is_directory=True)
+
+    db_path = str(tmp_path / "db")
+
+    # Index through the symlink.
+    r1 = index_folder(str(link), db_path=db_path)
+    assert r1["files_indexed"] == 2
+
+    # Add an exclusion and re-run — the prune must still see the vendored file
+    # and remove it, even though the path used to call index_folder is a
+    # symlink to a different real path.
+    (real / ".semanticignore").write_text("vendored/\n")
+    r2 = index_folder(str(link), db_path=db_path)
+    assert r2["files_excluded_pruned"] >= 1

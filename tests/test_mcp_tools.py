@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -372,3 +373,155 @@ async def test_mcp_get_index_status_on_pre_tier2_index(tmp_path):
     assert data["total_chunks"] == 1
     assert data["total_files"] == 1
     assert data["jobs"] == {"active": [], "recent": []}
+
+
+# -- Exclusion rules: MCP surface --------------------------------------------
+
+@pytest.mark.anyio
+async def test_mcp_index_folder_accepts_exclude_param(mock_model, tmp_path):
+    """The MCP tool accepts an `exclude` list and forwards it to indexing."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "keep.md").write_text("real content")
+    (corpus / "vendored").mkdir()
+    (corpus / "vendored" / "junk.md").write_text("library README")
+
+    db_path = str(tmp_path / "db")
+    async with Client(mcp) as client:
+        start = await client.call_tool(
+            "index_folder",
+            {
+                "folder_path": str(corpus),
+                "db_path": db_path,
+                "exclude": ["vendored/**"],
+            },
+        )
+        job_id = json.loads(start.content[0].text)["job_id"]
+        job = await _wait_for_job(client, db_path, job_id)
+
+    assert job["state"] == "completed"
+    assert job["result"]["files_indexed"] == 1
+    assert job["result"]["exclusion_patterns"] == ["vendored/**"]
+
+
+@pytest.mark.anyio
+async def test_mcp_index_folder_rejects_invalid_exclude_pattern(docs_dir, tmp_path):
+    """A syntactically invalid exclusion pattern is rejected immediately —
+    no job is started, no index touched, and the error message names the
+    offending pattern."""
+    db_path = str(tmp_path / "db")
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "index_folder",
+            {
+                "folder_path": str(docs_dir),
+                "db_path": db_path,
+                "exclude": ["\\"],  # bare backslash — invalid gitwildmatch
+            },
+        )
+        data = json.loads(result.content[0].text)
+
+    assert data["status"] == "rejected"
+    assert data["reason"] == "invalid_exclusion_pattern"
+    assert "\\" in data["message"]
+    assert registry.has_running() is False  # no job was ever created
+
+
+@pytest.mark.anyio
+async def test_mcp_reindex_file_bypasses_semanticignore(mock_model, tmp_path):
+    """reindex_file is an explicit per-file ask — it bypasses .semanticignore
+    so a caller can still force-index a file that would otherwise be excluded."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / ".semanticignore").write_text("vendored/\n")
+    (corpus / "vendored").mkdir()
+    target = corpus / "vendored" / "force_me.md"
+    target.write_text("explicitly requested content")
+
+    db_path = str(tmp_path / "db")
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "reindex_file", {"file_path": str(target), "db_path": db_path}
+        )
+        data = json.loads(result.content[0].text)
+
+    assert data["status"] == "reindexed"
+    assert data["chunks_created"] >= 1
+
+
+@pytest.mark.anyio
+async def test_mcp_reindex_file_rejects_path_inside_index_dir(tmp_path):
+    """reindex_file must refuse a path that lives inside the LanceDB directory
+    — otherwise a stray call could try to parse the index's own files."""
+    db_path = str(tmp_path / "db")
+    db_dir = Path(db_path)
+    db_dir.mkdir(parents=True)
+    inside = db_dir / "data.lance" / "something.md"
+    inside.parent.mkdir(parents=True)
+    inside.write_text("# inside the index dir")
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "reindex_file", {"file_path": str(inside), "db_path": db_path}
+        )
+        data = json.loads(result.content[0].text)
+
+    assert data["status"] == "rejected"
+    assert data["reason"] == "inside_index_dir"
+
+
+@pytest.mark.anyio
+async def test_mcp_get_index_status_returns_exclusions_for_folder(mock_model, tmp_path):
+    """When folder_path is supplied, get_index_status surfaces the active
+    .semanticignore for that folder."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / ".semanticignore").write_text(
+        "# header comment\n"
+        "vendored/\n"
+        "*.log\n"
+    )
+    db_path = str(tmp_path / "db")
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "get_index_status", {"db_path": db_path, "folder_path": str(corpus)}
+        )
+        data = json.loads(result.content[0].text)
+
+    assert "exclusions" in data
+    assert data["exclusions"] is not None
+    assert data["exclusions"]["folder_path"] == str(corpus)
+    assert data["exclusions"]["semanticignore_path"] == str(corpus / ".semanticignore")
+    assert "vendored/" in data["exclusions"]["patterns"]
+    assert "*.log" in data["exclusions"]["patterns"]
+
+
+@pytest.mark.anyio
+async def test_mcp_get_index_status_exclusions_null_when_no_file(mock_model, tmp_path):
+    """When folder_path is supplied but no .semanticignore exists, exclusions
+    is explicitly null — the caller can tell 'no rules' apart from 'not asked'."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    db_path = str(tmp_path / "db")
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "get_index_status", {"db_path": db_path, "folder_path": str(corpus)}
+        )
+        data = json.loads(result.content[0].text)
+
+    assert "exclusions" in data
+    assert data["exclusions"] is None
+
+
+@pytest.mark.anyio
+async def test_mcp_get_index_status_omits_exclusions_without_folder_path(tmp_path):
+    """When folder_path is NOT supplied, the exclusions field is omitted — the
+    indexed root isn't persisted so there's nothing honest to report."""
+    db_path = str(tmp_path / "db")
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_index_status", {"db_path": db_path})
+        data = json.loads(result.content[0].text)
+
+    assert "exclusions" not in data

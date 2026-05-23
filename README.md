@@ -183,10 +183,10 @@ Works the same with PDFs, Word docs, PowerPoints, and CSVs -- just point it at a
 
 | Tool | Description |
 |------|-------------|
-| `index_folder` | Index or re-index all documents in a folder. Incremental -- skips unchanged files. |
+| `index_folder` | Index or re-index all documents in a folder. Incremental -- skips unchanged files. Honours a `.semanticignore` at the folder root and an optional `exclude` parameter (see [Excluding files](#excluding-files-and-folders) below). |
 | `semantic_search` | Search indexed documents using natural language. Supports `vector` and `hybrid` modes. |
-| `get_index_status` | Show total chunks, file count, indexed files, index size on disk, and background-job history. |
-| `reindex_file` | Force re-index a single file, bypassing the hash cache. |
+| `get_index_status` | Show total chunks, file count, indexed files, index size on disk, and background-job history. Pass `folder_path` to also surface the active `.semanticignore` for that folder. |
+| `reindex_file` | Force re-index a single file, bypassing the hash cache. Bypasses exclusion rules -- this is an explicit per-file act. |
 
 ## How It Works
 
@@ -224,6 +224,48 @@ Notes:
 - The index directory and **all** indexed folders must be on the same volume.
 - Mount points differ per machine, so set `LANCEDB_PATH` to wherever the drive mounts on each Mac (e.g. `/Volumes/MyDrive` vs `/Volumes/MyDrive-1`).
 - Use an **absolute** path -- the `./lancedb` default is relative to the working directory and is not portable.
+
+</details>
+
+<details id="excluding-files-and-folders">
+<summary><strong>Excluding files and folders</strong></summary>
+
+`index_folder` walks the target folder recursively and indexes anything matching the supported file types. For a typical project or `~/Documents` tree, that usually means you want to skip a few things — vendored libraries, build artifacts, caches, personal subfolders. Two ways to do that, combined:
+
+- **`.semanticignore`** at the folder's root. Same syntax as `.gitignore` (via [`pathspec`](https://pypi.org/project/pathspec/)), durable and version-controllable. Example:
+
+  ```gitignore
+  # Build artifacts
+  build/
+  dist/
+
+  # Vendored deps
+  node_modules/
+  vendor/
+
+  # Logs and caches
+  *.log
+  .cache/
+
+  # …but keep this one curated log
+  !keep.log
+  ```
+
+- **`exclude` parameter** on the `index_folder` tool call. Same syntax, ad-hoc per call. Combined with whatever `.semanticignore` declares (union semantics; negation in the param can re-include a path the file excludes).
+
+```
+You: "Index ~/Documents/projects, but skip node_modules and any *.log files"
+```
+
+…becomes `index_folder(folder_path="~/Documents/projects", exclude=["node_modules/**", "*.log"])`.
+
+**Re-runs converge.** Adding a rule to `.semanticignore` and re-running `index_folder` *prunes* the now-excluded chunks from the index — the result reports `files_excluded_pruned: N`. Removing a rule and re-running re-indexes the files normally on their next change.
+
+**No default ignore list.** The indexer ships with no opinionated defaults — whatever you don't exclude gets indexed. The only hard-coded rule is that the active LanceDB directory cannot be indexed (so the index can't end up indexing itself when it lives under the walked folder); user negation cannot cancel this.
+
+**Bad rules fail fast.** A syntactically invalid pattern is reported synchronously as `status: "rejected", reason: "invalid_exclusion_pattern"` and no indexing job is started.
+
+**Inspecting active rules.** Call `get_index_status(folder_path="…")` to surface the active `.semanticignore` patterns for that folder. (Ad-hoc `exclude` patterns aren't persisted, so they don't appear here.)
 
 </details>
 
@@ -269,12 +311,13 @@ for r in results["results"]:
 
 ```
 server/
-  main.py       # MCP server + tool definitions
-  parsers.py    # Per-format text extraction
-  chunker.py    # Text splitting with metadata
-  indexer.py    # Discovery, hashing, embedding pipeline
-  store.py      # LanceDB vector store + FTS + hybrid search
-  search.py     # Query embedding + search orchestration
+  main.py        # MCP server + tool definitions
+  parsers.py     # Per-format text extraction
+  chunker.py     # Text splitting with metadata
+  indexer.py     # Discovery, hashing, embedding pipeline
+  store.py       # LanceDB vector store + FTS + hybrid search
+  search.py      # Query embedding + search orchestration
+  exclusions.py  # .semanticignore + exclude param (gitignore syntax)
 ```
 
 | Component | Choice | Why |
@@ -295,7 +338,7 @@ source .venv/bin/activate
 pytest tests/ -v
 ```
 
-131 tests covering parsers, chunking, indexing, search, path portability, background indexing jobs, and MCP tool integration.
+180 tests covering parsers, chunking, indexing, search, path portability, exclusion rules, background indexing jobs, and MCP tool integration.
 
 Contributions welcome -- open an issue or submit a PR.
 
