@@ -128,7 +128,7 @@ async def index_folder(
     interrupted by a server restart shows up afterwards as 'interrupted';
     simply re-run to recover (unchanged files are skipped, so it is cheap).
 
-    Files larger than the MAX_FILE_SIZE_MB cap (default 100 MB) are skipped and
+    Files larger than the MAX_FILE_SIZE_MB cap (default 1024 MB) are skipped and
     reported in the result's oversized_files list rather than indexed. .pst
     archives stream from disk and are exempt from the cap.
 
@@ -364,7 +364,7 @@ def reindex_file(
 
     Rejected while a background index_folder job is running, to keep a single
     writer on the index — retry once that job finishes. A file over the
-    MAX_FILE_SIZE_MB cap (default 100 MB) is returned with status 'skipped' and
+    MAX_FILE_SIZE_MB cap (default 1024 MB) is returned with status 'skipped' and
     the index is left untouched; .pst archives are exempt from the cap.
 
     Exclusion rules (.semanticignore / index_folder's `exclude` param) are

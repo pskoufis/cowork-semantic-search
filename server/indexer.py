@@ -29,9 +29,9 @@ FLUSH_CHUNK_THRESHOLD = 1000
 # into memory (a CSV transiently holds ~3x its size). Override via the
 # MAX_FILE_SIZE_MB env var; set it to 0 to disable the cap entirely.
 try:
-    _MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "100"))
+    _MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "1024"))
 except ValueError:
-    _MAX_FILE_SIZE_MB = 100
+    _MAX_FILE_SIZE_MB = 1024
 MAX_FILE_SIZE_BYTES = _MAX_FILE_SIZE_MB * 1024 * 1024 if _MAX_FILE_SIZE_MB > 0 else 0
 
 # Formats whose parser retains only a bounded preview, so the size cap above

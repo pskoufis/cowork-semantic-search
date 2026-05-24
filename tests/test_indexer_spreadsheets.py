@@ -181,7 +181,7 @@ def test_index_folder_reenqueues_when_dismissed_hash_differs(tmp_path):
 
 
 def test_exceeds_size_cap_exempts_spreadsheets(monkeypatch):
-    """Spreadsheet parsers stream their preview, so the global 100 MB cap
+    """Spreadsheet parsers stream their preview, so the global size cap
     must not skip them regardless of file size."""
     monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 100)
     from server.indexer import exceeds_size_cap

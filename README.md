@@ -277,10 +277,10 @@ Indexing scales to large corpora (tens of GB, hundreds of thousands of files). A
 
 - **Disk capacity.** The index stores each chunk's text plus a 256-dimensional vector, alongside full-text and ANN indexes. Expect the index directory to be **roughly the size of -- or larger than -- the source corpus**. Make sure the volume holding `LANCEDB_PATH` has headroom. Compaction runs automatically after every indexing run, so old versions and fragments don't pile up. `get_index_status` reports the current index size on disk (`db_size`).
 
-- **Large files.** Files above a size cap (default **100 MB**) are skipped rather than indexed, so a single huge file cannot exhaust memory -- every parser loads the whole file. Skipped files are reported in the `index_folder` result under `oversized_files`. Change the cap with the `MAX_FILE_SIZE_MB` environment variable (set it to `0` to disable the cap):
+- **Large files.** Files above a size cap (default **1024 MB**) are skipped rather than indexed, so a single huge file cannot exhaust memory -- every parser loads the whole file. Skipped files are reported in the `index_folder` result under `oversized_files`. Change the cap with the `MAX_FILE_SIZE_MB` environment variable (set it to `0` to disable the cap):
 
   ```json
-  "env": { "MAX_FILE_SIZE_MB": "250" }
+  "env": { "MAX_FILE_SIZE_MB": "2048" }
   ```
 
 - **Interrupted runs.** Indexing runs in the background and can take a long time on a large corpus. Job records are saved next to the index, so if the server is restarted mid-run, `get_index_status` reports that job as `interrupted`. There is no separate resume step -- just run `index_folder` again. Unchanged files are detected by a fast modification-time check and skipped, so re-running after an interruption is cheap.
