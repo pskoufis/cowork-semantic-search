@@ -222,9 +222,10 @@ By default the index lives in `./lancedb` next to the server. To make the index 
 The index stores document paths **relative to `LANCEDB_PATH`**, so as long as the index directory and the indexed folders stay on the same volume, you can unplug the drive, re-plug it (even at a different mount point), or move it to another Mac -- incremental indexing and search keep working without re-indexing.
 
 Notes:
-- The index directory and **all** indexed folders must be on the same volume.
 - Mount points differ per machine, so set `LANCEDB_PATH` to wherever the drive mounts on each Mac (e.g. `/Volumes/MyDrive` vs `/Volumes/MyDrive-1`).
 - Use an **absolute** path -- the `./lancedb` default is relative to the working directory and is not portable.
+
+**Cross-volume layouts (index and corpus on different volumes).** If `LANCEDB_PATH` is on a different volume than the indexed folder, the library falls back to storing **absolute** paths instead of relative ones. The index works, but it is no longer portable across remounts -- if the corpus drive mounts at a different path later (e.g. `/Volumes/MyDrive-1` instead of `/Volumes/MyDrive`), the stored paths become stale and you'll need to re-run `index_folder` against the new mount point (orphan cleanup will replace the stale rows). The most common reason to want this layout: the document drive is **exFAT** (cross-platform with Windows), which LanceDB cannot host because it lacks atomic rename -- so the index has to live on the internal APFS disk while the documents stay on the external drive.
 
 </details>
 

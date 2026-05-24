@@ -29,10 +29,13 @@ def semantic_search(
         [query], normalize_embeddings=True, prompt_name="query",
     )[0].tolist()
 
-    # The caller passes an absolute folder path; the store holds relative paths.
+    # The caller passes an absolute folder path; the store holds paths in the
+    # form chosen by to_relative (relative for same-volume, absolute for
+    # cross-volume). Recomputing the filter with the same function here keeps
+    # the storage form aligned so the exact-match WHERE clause hits the
+    # corresponding rows.
     folder_filter = (
-        to_relative(folder_path, db_dir, check_volume=False)
-        if folder_path else None
+        to_relative(folder_path, db_dir) if folder_path else None
     )
 
     if mode == "hybrid":
@@ -52,7 +55,9 @@ def semantic_search(
             file_type=file_type,
         )
 
-    # Resolve stored relative paths back to absolute for display.
+    # Resolve stored paths back to absolute for display. Stored paths are
+    # relative for same-volume entries and absolute for cross-volume entries;
+    # to_absolute handles both.
     for r in results:
         r["source_file"] = to_absolute(r["source_file"], db_dir)
         r["folder_path"] = to_absolute(r["folder_path"], db_dir)

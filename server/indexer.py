@@ -263,7 +263,7 @@ def index_folder(
     descriptions_sampled = 0  # filled in by the async auto-drainer post-call
     errors = []
     oversized_files = []  # files skipped for exceeding MAX_FILE_SIZE_BYTES
-    current_files = set()  # paths relative to the index directory
+    current_files = set()  # storage form returned by to_relative (relative same-volume, absolute cross-volume)
     buffer: list[dict] = []  # chunks awaiting a batched write
 
     for idx, file_path in enumerate(files):
@@ -396,7 +396,8 @@ def index_folder(
         progress_callback(len(files), len(files))
 
     # Clean up chunks for files deleted from within this folder only.
-    # Stored paths are relative — resolve to absolute before the scope check.
+    # Stored paths may be relative (same-volume) or absolute (cross-volume);
+    # to_absolute handles both before the scope check.
     # Skip excluded paths so the prune-pass count and this orphan count never
     # claim the same file: an excluded file is already gone from the store by
     # the time we reach here, but the guard makes the intent explicit.

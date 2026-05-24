@@ -1,8 +1,6 @@
 import os
 from unittest.mock import patch
 
-import pytest
-
 from server.paths import to_relative, to_absolute
 
 
@@ -58,16 +56,46 @@ def _fake_stat(path, *args, **kwargs):
     return type("S", (), {"st_dev": dev})()
 
 
-def test_volume_mismatch_raises(tmp_path):
-    """A file on a different volume than the index is rejected."""
+def test_cross_volume_stores_absolute(tmp_path):
+    """A file on a different volume than the index is stored as an absolute path."""
     db = tmp_path / "lancedb"
     db.mkdir()
     f = tmp_path / "doc.md"
     f.write_text("hello")
 
     with patch("server.paths.os.stat", side_effect=_fake_stat):
-        with pytest.raises(ValueError, match="different volume"):
-            to_relative(str(f), str(db))
+        stored = to_relative(str(f), str(db))
+
+    assert os.path.isabs(stored)
+    assert stored == os.path.abspath(str(f))
+
+
+def test_cross_volume_roundtrips_through_to_absolute(tmp_path):
+    """A cross-volume absolute path returned from to_relative resolves back to
+    itself through to_absolute, regardless of the current index location."""
+    db = tmp_path / "lancedb"
+    db.mkdir()
+    f = tmp_path / "doc.md"
+    f.write_text("hello")
+
+    with patch("server.paths.os.stat", side_effect=_fake_stat):
+        stored = to_relative(str(f), str(db))
+
+    # to_absolute must short-circuit on already-absolute input, even when
+    # called against a different db_path (simulating a remounted index).
+    other_db = tmp_path / "elsewhere" / "lancedb"
+    assert to_absolute(stored, str(db)) == os.path.normpath(str(f))
+    assert to_absolute(stored, str(other_db)) == os.path.normpath(str(f))
+
+
+def test_to_absolute_passthrough_for_absolute_input(tmp_path):
+    """to_absolute returns absolute input unchanged (modulo normpath)."""
+    db = tmp_path / "lancedb"
+    db.mkdir()
+    abs_path = "/Volumes/External/docs/file.pdf"
+    assert to_absolute(abs_path, str(db)) == abs_path
+    # Normalization still applies (collapses trailing slashes, etc.).
+    assert to_absolute(abs_path + "/", str(db)) == abs_path
 
 
 def test_volume_check_skipped_when_disabled(tmp_path):
