@@ -1,10 +1,12 @@
 """Per-format text extraction from document files.
 
-Spreadsheet formats (.csv, .xlsx, .xlsm, .xls) are listed in
-SUPPORTED_EXTENSIONS so discover_files surfaces them, but they are
-deliberately routed by server/indexer.py to the description-queue path
-(server.spreadsheets) instead of through extract_text. extract_text raises
-for them so a stray caller can't fall back into the old raw-row scheme.
+Spreadsheet formats (.csv, .xlsx, .xlsm, .xls) are *temporarily disabled*
+from the indexing pipeline: the description-based path lives in
+server/spreadsheets.py and the MCP queue tools (list_pending_descriptions,
+submit_description, dismiss_pending_description) are still available, but
+discover_files no longer surfaces these files. To re-enable, restore them
+to SUPPORTED_EXTENSIONS below and remove the matching filter in
+server/indexer.py:discover_files.
 """
 
 import re
@@ -14,7 +16,8 @@ from pathlib import Path
 
 SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".pdf", ".docx", ".pptx",
-    ".csv", ".xlsx", ".xlsm", ".xls",
+    # Spreadsheets temporarily disabled — restore .csv, .xlsx, .xlsm, .xls
+    # here when the description-based path is ready for prime time.
     ".pst",
 }
 

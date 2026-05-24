@@ -112,8 +112,15 @@ def discover_files(
     When `exclusions` is set, directories matching an exclusion rule are
     pruned from the walk (the walker never descends into them), and matched
     files are filtered out.
+
+    Spreadsheet extensions are filtered out unconditionally, even when the
+    caller passes them in `file_types`, so the temporary "spreadsheet
+    indexing disabled" stance can't be sidestepped by an explicit override.
+    Restore by removing the subtraction below and re-adding the extensions
+    to `SUPPORTED_EXTENSIONS` in `server/parsers.py`.
     """
-    extensions = file_types or SUPPORTED_EXTENSIONS
+    extensions = set(file_types) if file_types else set(SUPPORTED_EXTENSIONS)
+    extensions -= SPREADSHEET_EXTENSIONS
     files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(folder_path):
         dpath = Path(dirpath)
@@ -393,7 +400,12 @@ def index_folder(
     # Skip excluded paths so the prune-pass count and this orphan count never
     # claim the same file: an excluded file is already gone from the store by
     # the time we reach here, but the guard makes the intent explicit.
+    # Also skip files whose type isn't currently indexable — without this
+    # guard, disabling a file type (e.g. spreadsheets) would silently delete
+    # every existing chunk of that type on the next run.
     for f_rel in store.get_all_files():
+        if Path(f_rel).suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
         f_abs_raw = Path(to_absolute(f_rel, db_dir))
         try:
             f_abs = f_abs_raw.resolve()

@@ -76,7 +76,9 @@ async def index_folder(
         Field(
             description="File extensions to index, e.g. ['.pdf', '.md']. "
                         "Defaults to all supported types: .txt, .md, .pdf, "
-                        ".docx, .pptx, .csv, .xlsx, .xlsm, .xls, .pst",
+                        ".docx, .pptx, .pst. Spreadsheets "
+                        "(.csv/.xlsx/.xlsm/.xls) are temporarily disabled "
+                        "and are silently filtered out even if passed here.",
             default=None,
         ),
     ] = None,
@@ -107,23 +109,17 @@ async def index_folder(
     """Start a background job to index or re-index all documents in a folder.
 
     Scans the folder for supported document types (.txt, .md, .pdf, .docx,
-    .pptx, .csv, .xlsx, .xlsm, .xls, .pst), extracts text, splits into
-    chunks, computes embeddings, stores them in a local vector database, and
-    builds an ANN index for fast search. Only files that have changed since
-    the last run are re-processed.
+    .pptx, .pst), extracts text, splits into chunks, computes embeddings,
+    stores them in a local vector database, and builds an ANN index for fast
+    search. Only files that have changed since the last run are re-processed.
 
-    Spreadsheets (.csv, .xlsx, .xlsm, .xls) follow a description-based path:
-    a small preview (headers + ~10 sample rows + dtypes + row count) is
-    extracted and enqueued for an LLM to write a topical description, which
-    is then embedded as the chunk. .csv and .xlsx/.xlsm are previewed via
-    streaming so size does not matter; .xls (legacy BIFF) is read whole by
-    xlrd but BIFF's 65,536-row-per-sheet cap keeps memory naturally bounded.
-    Automatic description generation runs only when the MCP client supports
-    sampling (ctx.sample); the result's `descriptions_sampled` reports how
-    many descriptions were drained. Without sampling support,
-    `descriptions_queued` is populated but `descriptions_sampled` stays 0 —
-    the host must drive `list_pending_descriptions` → `submit_description`
-    manually.
+    Spreadsheet indexing (.csv, .xlsx, .xlsm, .xls) is temporarily disabled.
+    These files are not discovered during a run, even if a caller passes
+    them explicitly in `file_types`. Description chunks already in the index
+    from a previous run are preserved — orphan-cleanup leaves them alone.
+    The MCP queue tools (`list_pending_descriptions`, `submit_description`,
+    `dismiss_pending_description`) remain available so any pre-existing
+    queue entries can still be drained or dismissed.
 
     Indexing runs in the background: this call returns immediately with a
     job_id. Poll get_index_status to follow progress and read the final result.
@@ -134,8 +130,7 @@ async def index_folder(
 
     Files larger than the MAX_FILE_SIZE_MB cap (default 100 MB) are skipped and
     reported in the result's oversized_files list rather than indexed. .pst
-    and the four spreadsheet types are exempt from the cap — the spreadsheet
-    parsers retain only the preview rows, so a 1 GB workbook is safe.
+    archives stream from disk and are exempt from the cap.
 
     Exclusion rules come from two sources, combined: a `.semanticignore` file
     at folder_path's root (gitignore syntax), and the `exclude` parameter. On
