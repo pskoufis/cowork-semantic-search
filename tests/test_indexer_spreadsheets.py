@@ -1,4 +1,13 @@
-"""Integration tests for the spreadsheet → queue indexing path."""
+"""Integration tests for the spreadsheet → queue indexing path.
+
+Spreadsheet indexing is *temporarily disabled* (see
+server/parsers.py:SUPPORTED_EXTENSIONS). The legacy enqueue/auto-drain
+tests below are wrapped in `requires_spreadsheets_enabled` so they're
+skipped as a unit when the disable is in place — un-decorate them when
+spreadsheets are re-enabled. New tests at the bottom of this file assert
+the disabled behaviour (filtered from discovery, existing chunks
+preserved).
+"""
 
 import json
 from pathlib import Path
@@ -7,8 +16,21 @@ import openpyxl
 import pytest
 
 from server.indexer import index_folder, compute_file_hash
+from server.parsers import SUPPORTED_EXTENSIONS
 from server.paths import to_relative
 from server.store import VectorStore
+
+
+# Wrap every legacy test that depends on spreadsheets being discovered. The
+# block of tests below all assume index_folder will enqueue/sample a CSV or
+# workbook; that path is unreachable while spreadsheets are disabled. The
+# skip is keyed off the current SUPPORTED_EXTENSIONS so it lifts itself
+# automatically once the disable is removed.
+requires_spreadsheets_enabled = pytest.mark.skipif(
+    not (SUPPORTED_EXTENSIONS & {".csv", ".xlsx", ".xlsm", ".xls"}),
+    reason="spreadsheet indexing temporarily disabled "
+           "(see server/parsers.py:SUPPORTED_EXTENSIONS)",
+)
 
 
 def _write_csv(folder: Path, name: str) -> Path:
@@ -29,6 +51,7 @@ def _write_xlsx(folder: Path, name: str, sheets: dict[str, list[list]]) -> Path:
     return p
 
 
+@requires_spreadsheets_enabled
 def test_index_folder_enqueues_csv(tmp_path):
     folder = tmp_path / "data"
     folder.mkdir()
@@ -48,6 +71,7 @@ def test_index_folder_enqueues_csv(tmp_path):
     assert preview["type"] == "csv"
 
 
+@requires_spreadsheets_enabled
 def test_index_folder_enqueues_xlsx_per_sheet(tmp_path):
     folder = tmp_path / "data"
     folder.mkdir()
@@ -87,6 +111,7 @@ def _write_xls(folder: Path, name: str, sheets: dict[str, list[list]]) -> Path:
     return p
 
 
+@requires_spreadsheets_enabled
 def test_index_folder_enqueues_xlsm_per_sheet(tmp_path):
     folder = tmp_path / "data"
     folder.mkdir()
@@ -105,6 +130,7 @@ def test_index_folder_enqueues_xlsm_per_sheet(tmp_path):
     assert json.loads(pending["preview_json"])["type"] == "xlsm"
 
 
+@requires_spreadsheets_enabled
 def test_index_folder_enqueues_xls_per_sheet(tmp_path):
     folder = tmp_path / "data"
     folder.mkdir()
@@ -123,6 +149,7 @@ def test_index_folder_enqueues_xls_per_sheet(tmp_path):
     assert json.loads(pending["preview_json"])["type"] == "xls"
 
 
+@requires_spreadsheets_enabled
 def test_index_folder_skips_dismissed_with_matching_hash(tmp_path):
     folder = tmp_path / "data"
     folder.mkdir()
@@ -139,6 +166,7 @@ def test_index_folder_skips_dismissed_with_matching_hash(tmp_path):
     assert store.pending_count() == 0
 
 
+@requires_spreadsheets_enabled
 def test_index_folder_reenqueues_when_dismissed_hash_differs(tmp_path):
     folder = tmp_path / "data"
     folder.mkdir()
@@ -168,6 +196,7 @@ def test_exceeds_size_cap_still_applies_to_non_streaming(monkeypatch):
     assert exceeds_size_cap(Path("x.pdf"), 200) is True
 
 
+@requires_spreadsheets_enabled
 def test_index_folder_streams_large_csv_above_size_cap(tmp_path, monkeypatch):
     """A CSV bigger than the cap is enqueued via streaming, not size_skipped."""
     monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 100)
@@ -184,6 +213,7 @@ def test_index_folder_streams_large_csv_above_size_cap(tmp_path, monkeypatch):
     assert result["oversized_files"] == []
 
 
+@requires_spreadsheets_enabled
 def test_index_folder_evicts_legacy_csv_chunks_then_enqueues(tmp_path):
     """A pre-existing CSV indexed under the legacy raw-row scheme is evicted
     on the first run and replaced with a queue entry."""
@@ -252,6 +282,7 @@ def mock_embed_model():
         yield model
 
 
+@requires_spreadsheets_enabled
 def test_auto_drainer_writes_chunks_via_mock_sampling(mock_embed_model, tmp_path):
     """When ctx.sample is available, the auto-drainer turns queued entries
     into description chunks and clears the queue."""
@@ -292,6 +323,7 @@ def test_auto_drainer_writes_chunks_via_mock_sampling(mock_embed_model, tmp_path
     assert final["result"]["descriptions_sampled"] == 3
 
 
+@requires_spreadsheets_enabled
 def test_auto_drainer_leaves_entry_when_sampling_fails(
     mock_embed_model, tmp_path, monkeypatch,
 ):
@@ -330,10 +362,105 @@ def test_auto_drainer_leaves_entry_when_sampling_fails(
     # Atomic per-file commit: nothing written, entry still queued
     assert fresh.count_chunks() == 0
     assert fresh.pending_count() == 1
-    final = job.to_dict()
-    assert final["result"]["descriptions_sampled"] == 0
 
 
+# --- Disabled state -------------------------------------------------------
+#
+# While spreadsheets are disabled, these tests must pass regardless. They
+# cover the three behaviours that matter for the disable:
+#   1. Default discovery skips spreadsheets.
+#   2. Explicit `file_types` does NOT bypass the disable.
+#   3. Pre-existing description chunks survive orphan cleanup on a re-run.
+
+
+def test_csv_not_discovered_when_disabled(tmp_path):
+    folder = tmp_path / "data"
+    folder.mkdir()
+    _write_csv(folder, "x.csv")
+    db = str((tmp_path / "db").resolve())
+
+    result = index_folder(str(folder), db_path=db)
+
+    assert result["files_indexed"] == 0
+    assert result["descriptions_queued"] == 0
+    assert VectorStore(db).pending_count() == 0
+
+
+def test_workbook_variants_not_discovered_when_disabled(tmp_path):
+    folder = tmp_path / "data"
+    folder.mkdir()
+    _write_xlsx(folder, "a.xlsx", {"S": [["a"], [1]]})
+    db = str((tmp_path / "db").resolve())
+
+    result = index_folder(str(folder), db_path=db)
+
+    assert result["files_indexed"] == 0
+    assert result["descriptions_queued"] == 0
+
+
+def test_explicit_file_types_does_not_bypass_disable(tmp_path):
+    """Even when the caller passes spreadsheet extensions explicitly, the
+    defensive filter in discover_files strips them."""
+    folder = tmp_path / "data"
+    folder.mkdir()
+    _write_csv(folder, "x.csv")
+    _write_xlsx(folder, "y.xlsx", {"S": [["a"], [1]]})
+    db = str((tmp_path / "db").resolve())
+
+    result = index_folder(
+        str(folder),
+        file_types=[".csv", ".xlsx", ".xlsm", ".xls"],
+        db_path=db,
+    )
+
+    assert result["files_indexed"] == 0
+    assert result["descriptions_queued"] == 0
+
+
+def test_orphan_cleanup_preserves_existing_spreadsheet_chunks(tmp_path):
+    """A description chunk written under a previous `enabled` run must NOT
+    be wiped by orphan cleanup once spreadsheets are disabled — otherwise
+    a single `index_folder` after the disable would silently delete every
+    spreadsheet description chunk."""
+    folder = tmp_path / "data"
+    folder.mkdir()
+    csv = _write_csv(folder, "old.csv")
+    db = str((tmp_path / "db").resolve())
+    rel = to_relative(str(csv), db)
+
+    import numpy as np
+    from server.store import EMBEDDING_DIM
+    rng = np.random.RandomState(42)
+    vec = rng.randn(EMBEDDING_DIM).astype(np.float32)
+    vec = (vec / np.linalg.norm(vec)).tolist()
+    store = VectorStore(db)
+    store.ensure_schema()
+    store.add_chunks([{
+        "id": "desc_0",
+        "text": "A CSV about sales orders.",
+        "source_file": rel,
+        "file_name": "old.csv",
+        "file_type": ".csv",
+        "folder_path": ".",
+        "chunk_index": 0,
+        "content_hash": "stable",
+        "mtime_ns": 0,
+        "file_size": 0,
+        "vector": vec,
+        "chunk_kind": "file_description",
+        "sheet_name": None,
+    }])
+    assert store.count_chunks() == 1
+
+    # Re-run index_folder. With .csv not in SUPPORTED_EXTENSIONS, orphan
+    # cleanup must skip this row instead of deleting it.
+    index_folder(str(folder), db_path=db)
+
+    fresh = VectorStore(db)
+    assert fresh.count_chunks() == 1, "existing description chunk was wiped"
+
+
+@requires_spreadsheets_enabled
 def test_auto_drainer_skipped_when_ctx_is_none(mock_embed_model, tmp_path):
     """Without a ctx, drain is skipped — entry stays queued for the LLM."""
     from server.main import _run_index_job

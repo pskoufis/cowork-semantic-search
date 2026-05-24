@@ -143,11 +143,10 @@ def test_parse_pptx_empty_slide(tmp_path):
 # into the old raw-row scheme.
 
 def test_extract_text_rejects_spreadsheet_extensions(tmp_path):
-    """CSV/XLSX raise ValueError from extract_text — they belong on the
-    spreadsheet preview path (see server.spreadsheets)."""
-    assert ".csv" in SUPPORTED_EXTENSIONS
-    assert ".xlsx" in SUPPORTED_EXTENSIONS
-
+    """extract_text rejects spreadsheet extensions regardless of whether
+    they're currently in SUPPORTED_EXTENSIONS — those formats belong on
+    the spreadsheet preview path (server.spreadsheets) and a stray caller
+    must never fall into the old raw-row scheme."""
     csv_file = tmp_path / "x.csv"
     csv_file.write_text("a,b\n1,2\n")
     with pytest.raises(ValueError):

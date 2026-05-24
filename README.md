@@ -35,7 +35,7 @@ Your documents --> chunked --> embedded --> local vector DB
 - **Incremental indexing** -- SHA-256 content hashing. Only changed files get reprocessed. Re-indexing 1000 files where 3 changed takes seconds.
 - **Multilingual** -- handles 50+ languages natively. Search in one language, find results in another.
 - **Hybrid search** -- combines semantic similarity with full-text keyword search via Reciprocal Rank Fusion. Catches what pure vector search misses.
-- **Multiple formats** -- txt, md, pdf, docx, pptx, csv, xlsx/xlsm/xls, pst out of the box.
+- **Multiple formats** -- txt, md, pdf, docx, pptx, pst out of the box. (Spreadsheet support — csv, xlsx, xlsm, xls — is wired but temporarily disabled.)
 - **Any MCP client** -- works with Claude Code, Cursor, Windsurf, Cline, and any other MCP-compatible tool.
 - **Zero infrastructure** -- LanceDB stores everything as local files. No server, no Docker, no database to manage.
 
@@ -48,11 +48,9 @@ Your documents --> chunked --> embedded --> local vector DB
 | PDF | `.pdf` | Page-level extraction with metadata |
 | Word | `.docx` | Full paragraph extraction |
 | PowerPoint | `.pptx` | Slide-level extraction with metadata |
-| CSV | `.csv` | Streaming preview → LLM-written description, embedded as the chunk |
-| Excel | `.xlsx`, `.xlsm`, `.xls` | Per-sheet preview + file-level rollup, each described by the LLM. `.xlsx`/`.xlsm` stream via openpyxl; `.xls` (legacy BIFF) is read whole but bounded by BIFF's 65,536-row sheet cap. |
 | Outlook archive | `.pst` | One part per mail message, with attachment text |
 
-> **Spreadsheets need a sampling-capable MCP client** (Claude Desktop, Claude Code) for descriptions to be generated automatically during `index_folder`. Without sampling, entries are queued and the host must drain them via `list_pending_descriptions` → `submit_description`.
+> **Spreadsheets (csv, xlsx, xlsm, xls) are temporarily disabled.** The description-based path (preview → LLM-written description → embedded chunk) is implemented in `server/spreadsheets.py` and the MCP queue tools (`list_pending_descriptions` / `submit_description` / `dismiss_pending_description`) are still available, but `index_folder` does not currently discover these files. Description chunks already in the index from prior runs are preserved. Re-enable by restoring `.csv`/`.xlsx`/`.xlsm`/`.xls` to `SUPPORTED_EXTENSIONS` in `server/parsers.py` and removing the subtraction in `server/indexer.py:discover_files`.
 
 ## Quick Start
 
