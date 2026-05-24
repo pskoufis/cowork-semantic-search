@@ -55,7 +55,9 @@ def semantic_search(
             file_type=file_type,
         )
 
-    # Resolve stored relative paths back to absolute for display.
+    # Resolve stored paths back to absolute for display. Stored paths are
+    # relative for same-volume entries and absolute for cross-volume entries;
+    # to_absolute handles both.
     for r in results:
         r["source_file"] = to_absolute(r["source_file"], db_dir)
         r["folder_path"] = to_absolute(r["folder_path"], db_dir)
