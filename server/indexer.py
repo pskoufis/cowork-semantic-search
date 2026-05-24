@@ -34,11 +34,12 @@ except ValueError:
     _MAX_FILE_SIZE_MB = 100
 MAX_FILE_SIZE_BYTES = _MAX_FILE_SIZE_MB * 1024 * 1024 if _MAX_FILE_SIZE_MB > 0 else 0
 
-# Formats whose parser streams the file from disk instead of reading it whole,
-# so the size cap above must not apply. pypff reads a .pst incrementally; real
-# Outlook archives are routinely multi-GB and the cap would skip them all.
-# (OOM protection for .pst moves to a per-attachment guard inside the parser.)
-STREAMING_EXTENSIONS = {".pst"}
+# Formats whose parser retains only a bounded preview, so the size cap above
+# must not apply. pypff reads a .pst incrementally; real Outlook archives are
+# routinely multi-GB. csv and xlsx/xlsm preview via streaming; xls loads the
+# whole BIFF document but is bounded by BIFF's 65,536-row-per-sheet cap. Only
+# headers + ~10 sample rows ever land in the preview regardless of file size.
+STREAMING_EXTENSIONS = {".pst", ".csv", ".xlsx", ".xlsm", ".xls"}
 
 
 def exceeds_size_cap(file_path: Path, size: int) -> bool:

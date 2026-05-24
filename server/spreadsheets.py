@@ -6,12 +6,11 @@ queue and prompt-builders can be uniform.
 """
 
 import csv
-import io
 from pathlib import Path
 
 SAMPLE_ROW_LIMIT = 10
 MAX_DESCRIPTION_BYTES = 4096
-SPREADSHEET_EXTENSIONS = {".csv", ".xlsx"}
+SPREADSHEET_EXTENSIONS = {".csv", ".xlsx", ".xlsm", ".xls"}
 
 
 def _infer_dtype(value: str) -> str:
@@ -40,45 +39,58 @@ def _column_dtypes(sample_rows: list[list[str]], n_cols: int) -> list[str]:
     return dtypes
 
 
-def _extract_csv_preview(file_path: Path) -> dict:
-    """Build the preview for a single CSV file (a CSV is one 'sheet')."""
-    raw = file_path.read_text(encoding="utf-8", errors="replace")
-    if not raw.strip():
-        return {
-            "name": file_path.name,
-            "headers": None,
-            "first_row_as_data": True,
-            "dtypes": [],
-            "row_count": 0,
-            "sample_rows": [],
-        }
+_EMPTY_CSV_PREVIEW_FIELDS = {
+    "headers": None,
+    "first_row_as_data": True,
+    "dtypes": [],
+    "row_count": 0,
+    "sample_rows": [],
+}
 
-    # Sniffer needs a non-empty sample; cap to first 64KB so huge files don't
-    # hold the whole text in a second buffer just for detection.
-    sample = raw[:65536]
+
+def _extract_csv_preview(file_path: Path) -> dict:
+    """Build the preview for a single CSV file (a CSV is one 'sheet').
+
+    Streams the file: only the first ~SAMPLE_ROW_LIMIT+1 rows are ever held
+    in memory regardless of file size. The exact row_count is computed in
+    the same single pass.
+    """
+    # Sniffer needs a small text sample to decide whether row 0 is a header.
+    # Read just 64KB instead of loading the whole file.
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        sample = f.read(65536)
+
+    if not sample.strip():
+        return {"name": file_path.name, **_EMPTY_CSV_PREVIEW_FIELDS}
+
     try:
         has_header = csv.Sniffer().has_header(sample)
     except csv.Error:
         has_header = False
 
-    reader = csv.reader(io.StringIO(raw))
-    rows = list(reader)
-    if not rows:
-        return {
-            "name": file_path.name,
-            "headers": None,
-            "first_row_as_data": True,
-            "dtypes": [],
-            "row_count": 0,
-            "sample_rows": [],
-        }
+    # Buffer cap: header (if any) + SAMPLE_ROW_LIMIT data rows. Past that we
+    # just bump the counter — the buffer stays small for any file size.
+    buf_cap = SAMPLE_ROW_LIMIT + (1 if has_header else 0)
+    buf: list[list[str]] = []
+    total_rows = 0
+    with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            total_rows += 1
+            if len(buf) < buf_cap:
+                buf.append(row)
+
+    if total_rows == 0:
+        return {"name": file_path.name, **_EMPTY_CSV_PREVIEW_FIELDS}
 
     if has_header:
-        headers = rows[0]
-        data_rows = rows[1:]
+        headers = buf[0]
+        data_rows = buf[1:]
+        data_count = total_rows - 1
     else:
         headers = None
-        data_rows = rows
+        data_rows = buf
+        data_count = total_rows
 
     sample_rows = data_rows[:SAMPLE_ROW_LIMIT]
     n_cols = len(headers) if headers else (len(sample_rows[0]) if sample_rows else 0)
@@ -89,7 +101,7 @@ def _extract_csv_preview(file_path: Path) -> dict:
         "headers": headers,
         "first_row_as_data": headers is None,
         "dtypes": dtypes,
-        "row_count": len(data_rows),
+        "row_count": data_count,
         "sample_rows": sample_rows,
     }
 
@@ -108,11 +120,14 @@ def _cell_to_str(value) -> str:
     """Coerce a cell value to its preview-string form.
 
     openpyxl returns Python objects (int, float, datetime, bool, None);
-    we stringify uniformly so the preview is JSON-encodable and consistent
-    with the CSV path.
+    xlrd surfaces every BIFF number as float even when the original cell
+    held an int. Stringify uniformly, and normalise integral floats to
+    their int form so "10" not "10.0" lands in the LLM prompt.
     """
     if value is None:
         return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     return str(value)
 
 
@@ -182,12 +197,73 @@ def _extract_xlsx_preview(file_path: Path) -> list[dict]:
     return previews
 
 
+def _extract_xls_preview(file_path: Path) -> list[dict]:
+    """Build per-sheet previews for a legacy .xls workbook via xlrd.
+
+    BIFF caps each sheet at 65,536 rows so memory is naturally bounded.
+    Uses on_demand=True so sheets load lazily, and unloads each one after
+    we've sampled it to keep the working set small for multi-sheet files.
+    """
+    import xlrd
+
+    try:
+        book = xlrd.open_workbook(str(file_path), on_demand=True)
+    except Exception as exc:
+        # xlrd raises a variety of types (XLRDError, CompDocError, OSError,
+        # ValueError) for malformed/encrypted/non-BIFF files. Surface them
+        # uniformly as the same per-file failure the indexer already handles.
+        raise UnreadableSpreadsheetError(str(exc)) from exc
+
+    previews: list[dict] = []
+    try:
+        for sheet_idx in range(book.nsheets):
+            sheet = book.sheet_by_index(sheet_idx)
+            sheet_name = sheet.name
+            n_rows_total = sheet.nrows
+            n_cols = sheet.ncols
+            sample_limit = min(n_rows_total, SAMPLE_ROW_LIMIT + 1)
+            collected: list[list[str]] = [
+                [_cell_to_str(sheet.cell_value(r, c)) for c in range(n_cols)]
+                for r in range(sample_limit)
+            ]
+            book.unload_sheet(sheet_idx)
+
+            if not collected:
+                previews.append({
+                    "name": sheet_name,
+                    "headers": None,
+                    "first_row_as_data": True,
+                    "dtypes": [],
+                    "row_count": 0,
+                    "sample_rows": [],
+                })
+                continue
+
+            headers = collected[0]
+            data_rows = collected[1:]
+            sample = data_rows[:SAMPLE_ROW_LIMIT]
+            data_count = max(n_rows_total - 1, 0)
+            dtypes = _column_dtypes(sample, n_cols)
+            previews.append({
+                "name": sheet_name,
+                "headers": headers,
+                "first_row_as_data": False,
+                "dtypes": dtypes,
+                "row_count": data_count,
+                "sample_rows": sample,
+            })
+    finally:
+        book.release_resources()
+
+    return previews
+
+
 def extract_preview(file_path: Path) -> dict:
     """Build the full preview dict for a spreadsheet.
 
-    Returns {"type": "csv"|"xlsx", "sheets": [sheet_preview, ...]}.
-    CSV has exactly one sheet (using the file name). XLSX has one entry
-    per worksheet.
+    Returns {"type": "csv"|"xlsx"|"xlsm"|"xls", "sheets": [sheet_preview, ...]}.
+    CSV has exactly one sheet (using the file name). Workbook formats have
+    one entry per worksheet.
 
     Raises ValueError for unsupported extensions; UnreadableSpreadsheetError
     for files that can't be opened.
@@ -195,8 +271,13 @@ def extract_preview(file_path: Path) -> dict:
     suffix = file_path.suffix.lower()
     if suffix == ".csv":
         return {"type": "csv", "sheets": [_extract_csv_preview(file_path)]}
-    if suffix == ".xlsx":
-        return {"type": "xlsx", "sheets": _extract_xlsx_preview(file_path)}
+    if suffix in {".xlsx", ".xlsm"}:
+        return {
+            "type": suffix.lstrip("."),
+            "sheets": _extract_xlsx_preview(file_path),
+        }
+    if suffix == ".xls":
+        return {"type": "xls", "sheets": _extract_xls_preview(file_path)}
     raise ValueError(f"Not a spreadsheet: {suffix}")
 
 
