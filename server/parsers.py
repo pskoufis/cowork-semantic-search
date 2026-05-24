@@ -7,7 +7,7 @@ import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx", ".pptx", ".csv", ".pst"}
+SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx", ".pptx", ".csv", ".xlsx", ".pst"}
 
 
 def extract_text(file_path: Path) -> list[dict]:

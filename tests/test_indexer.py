@@ -412,8 +412,12 @@ def test_index_folder_migrates_pre_tier2_index(tmp_path):
     db_path = str(tmp_path / "db")
 
     # Hand-build a pre-Tier-2 index: old schema, real content hashes, no stats.
+    # Also strip chunk_kind/sheet_name so this stays a "fully pre-everything"
+    # simulated index — the migration path adds all of them in one pass.
     old_schema = pa.schema(
-        [f for f in SCHEMA if f.name not in ("mtime_ns", "file_size")]
+        [f for f in SCHEMA if f.name not in (
+            "mtime_ns", "file_size", "chunk_kind", "sheet_name",
+        )]
     )
     rows = []
     for f in (corpus / "a.txt", corpus / "b.txt"):

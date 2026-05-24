@@ -1,6 +1,7 @@
 """Document indexing pipeline: discover, parse, chunk, embed, store."""
 
 import hashlib
+import json
 import os
 import time
 from pathlib import Path
@@ -9,6 +10,12 @@ from typing import Callable
 from server.parsers import extract_text, SUPPORTED_EXTENSIONS
 from server.chunker import chunk_document
 from server.exclusions import ExclusionRules
+from server.spreadsheets import (
+    SPREADSHEET_EXTENSIONS,
+    UnreadableSpreadsheetError,
+    extract_preview,
+    needs_for_preview,
+)
 from server.store import VectorStore
 from server.paths import to_relative, to_absolute
 
@@ -201,7 +208,12 @@ def index_folder(
     exclusions = ExclusionRules.load(folder, extra_patterns=exclude, db_dir=db_dir)
 
     store = VectorStore(db_dir)
-    store.ensure_schema()  # migrate a pre-Tier-2 index in place, if needed
+    store.ensure_schema()  # migrate older indexes in place, if needed
+    # One-shot eviction: drop any legacy CSV/XLSX text chunks so they're
+    # re-processed via the description path on this run. The returned set
+    # tells the per-file loop to bypass the content_hash short-circuit for
+    # those files even when the hash hasn't changed.
+    forced_reindex: set[str] = store.evict_legacy_spreadsheet_chunks()
     type_set = set(file_types) if file_types else None
     files = discover_files(folder, type_set, recursive, exclusions=exclusions)
     folder_resolved = folder.resolve()
@@ -239,6 +251,8 @@ def index_folder(
     start = time.time()
     indexed, skipped, deleted, failed, stats_refreshed = 0, 0, 0, 0, 0
     size_skipped = 0
+    descriptions_queued = 0
+    descriptions_sampled = 0  # filled in by the async auto-drainer post-call
     errors = []
     oversized_files = []  # files skipped for exceeding MAX_FILE_SIZE_BYTES
     current_files = set()  # paths relative to the index directory
@@ -273,6 +287,57 @@ def index_folder(
                 continue
 
             record = file_index.get(source_rel)
+            suffix = file_path.suffix.lower()
+            force = source_rel in forced_reindex
+
+            # Spreadsheet path: never index raw cells — extract a preview and
+            # enqueue an LLM-description request. Both auto-drain (later, via
+            # ctx.sample()) and the manual MCP tools turn queue entries into
+            # description chunks. Fast/hash short-circuits still apply, except
+            # on the one-shot legacy-eviction pass which bypasses them.
+            if suffix in SPREADSHEET_EXTENSIONS:
+                if (not force and record
+                        and record["mtime_ns"] == mtime_ns
+                        and record["file_size"] == size):
+                    skipped += 1
+                    continue
+
+                file_hash = compute_file_hash(file_path)
+
+                if (not force and record
+                        and record["content_hash"] == file_hash):
+                    store.update_file_stat(source_rel, mtime_ns, size)
+                    stats_refreshed += 1
+                    skipped += 1
+                    continue
+
+                if store.is_dismissed(source_rel, file_hash):
+                    skipped += 1
+                    continue
+
+                # New / changed / forced: drop old chunks first so the file
+                # is never half-old half-new.
+                store.delete_by_file(source_rel)
+                try:
+                    preview = extract_preview(file_path)
+                except UnreadableSpreadsheetError as exc:
+                    failed += 1
+                    errors.append({
+                        "file": str(file_path),
+                        "error": f"unreadable spreadsheet: {exc}",
+                    })
+                    continue
+
+                store.enqueue_pending(
+                    file_path=source_rel,
+                    needs=needs_for_preview(preview),
+                    preview_json=json.dumps(preview),
+                    content_hash=file_hash,
+                )
+                descriptions_queued += 1
+                indexed += 1  # counts as work done for the finalize trigger
+                forced_reindex.discard(source_rel)
+                continue
 
             # Fast path: stat unchanged -> file unchanged. No read, no hash.
             if (record
@@ -365,6 +430,8 @@ def index_folder(
         "errors": errors,
         "oversized_files": oversized_files,
         "exclusion_patterns": exclusions.patterns,
+        "descriptions_queued": descriptions_queued,
+        "descriptions_sampled": descriptions_sampled,
         "finalize_warnings": finalize_warnings,
         "duration_seconds": round(time.time() - start, 2),
     }
