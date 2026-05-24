@@ -52,6 +52,17 @@ PENDING_SCHEMA = pa.schema([
     pa.field("enqueued_at_ns", pa.int64()),
 ])
 
+# A file the LLM has explicitly declined to describe. The content_hash is
+# captured at dismissal time so that if the file later changes, the
+# dismissal becomes stale and the file is re-enqueued.
+DISMISSED_TABLE_NAME = "dismissed_files"
+
+DISMISSED_SCHEMA = pa.schema([
+    pa.field("file_path", pa.string()),
+    pa.field("content_hash", pa.string()),
+    pa.field("dismissed_at_ns", pa.int64()),
+])
+
 
 def _escape(value: str) -> str:
     """Double single quotes for safe interpolation into LanceDB where-clauses."""
@@ -507,3 +518,86 @@ class VectorStore:
             "preview_json": r["preview_json"],
             "content_hash": r["content_hash"],
         }
+
+    # --- dismissed_files table --------------------------------------------
+
+    def _get_dismissed_table(self):
+        try:
+            return self._db.open_table(DISMISSED_TABLE_NAME)
+        except Exception:
+            return None
+
+    def _ensure_dismissed_table(self):
+        table = self._get_dismissed_table()
+        if table is None:
+            table = self._db.create_table(
+                DISMISSED_TABLE_NAME, schema=DISMISSED_SCHEMA
+            )
+        return table
+
+    def dismiss(self, file_path: str, content_hash: str) -> None:
+        """Record a dismissal. Replaces any prior dismissal of the same path."""
+        import time
+        table = self._ensure_dismissed_table()
+        table.delete(f"file_path = '{_escape(file_path)}'")
+        table.add([{
+            "file_path": file_path,
+            "content_hash": content_hash,
+            "dismissed_at_ns": time.time_ns(),
+        }])
+
+    def is_dismissed(self, file_path: str, content_hash: str) -> bool:
+        table = self._get_dismissed_table()
+        if table is None:
+            return False
+        rows = (
+            table.search()
+            .where(
+                f"file_path = '{_escape(file_path)}' AND "
+                f"content_hash = '{_escape(content_hash)}'",
+                prefilter=True,
+            )
+            .limit(1)
+            .to_list()
+        )
+        return bool(rows)
+
+    def clear_dismissal(self, file_path: str) -> None:
+        table = self._get_dismissed_table()
+        if table is None:
+            return
+        table.delete(f"file_path = '{_escape(file_path)}'")
+
+    # --- one-shot legacy eviction -----------------------------------------
+
+    def evict_legacy_spreadsheet_chunks(self) -> set[str]:
+        """Delete any CSV/XLSX chunks stored under the legacy raw-row scheme.
+
+        Legacy = chunk_kind IS NULL OR chunk_kind = 'text'. Description
+        chunks (sheet_description, file_description) are left alone.
+
+        Returns the set of source_file paths whose chunks were evicted so
+        the caller can force re-processing on the next pass even when the
+        content hash hasn't changed.
+        """
+        table = self._get_table()
+        if table is None:
+            return set()
+        n = table.count_rows()
+        if n == 0:
+            return set()
+        legacy_predicate = (
+            "(file_type = '.csv' OR file_type = '.xlsx') AND "
+            "(chunk_kind IS NULL OR chunk_kind = 'text')"
+        )
+        rows = (
+            table.search()
+            .where(legacy_predicate, prefilter=True)
+            .select(["source_file"])
+            .limit(n)
+            .to_list()
+        )
+        affected = {r["source_file"] for r in rows}
+        if affected:
+            table.delete(legacy_predicate)
+        return affected
