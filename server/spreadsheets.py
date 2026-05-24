@@ -92,3 +92,91 @@ def _extract_csv_preview(file_path: Path) -> dict:
         "row_count": len(data_rows),
         "sample_rows": sample_rows,
     }
+
+
+class UnreadableSpreadsheetError(Exception):
+    """Raised when a spreadsheet cannot be opened (corrupt, encrypted, etc).
+
+    The caller treats this as a per-file failure: not enqueued, recorded in
+    the file's error list. Encrypted/password-protected files are the
+    common case but we deliberately don't try to distinguish — the LLM
+    can't describe what we can't open, regardless of cause.
+    """
+
+
+def _cell_to_str(value) -> str:
+    """Coerce a cell value to its preview-string form.
+
+    openpyxl returns Python objects (int, float, datetime, bool, None);
+    we stringify uniformly so the preview is JSON-encodable and consistent
+    with the CSV path.
+    """
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _extract_xlsx_preview(file_path: Path) -> list[dict]:
+    """Build per-sheet previews for a workbook.
+
+    Uses openpyxl read_only mode + iter_rows so we never materialise the
+    whole sheet. We pull one extra row beyond SAMPLE_ROW_LIMIT to compute
+    row_count without iterating the rest (sheet.max_row from read-only mode
+    is the workbook's recorded extent, which is reliable here).
+    """
+    import openpyxl
+    from openpyxl.utils.exceptions import InvalidFileException
+    import zipfile
+
+    try:
+        wb = openpyxl.load_workbook(
+            filename=str(file_path), read_only=True, data_only=True,
+        )
+    except (InvalidFileException, zipfile.BadZipFile, KeyError) as exc:
+        raise UnreadableSpreadsheetError(str(exc)) from exc
+
+    previews: list[dict] = []
+    try:
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows_iter = ws.iter_rows(values_only=True)
+            collected: list[list[str]] = []
+            for row in rows_iter:
+                collected.append([_cell_to_str(c) for c in row])
+                if len(collected) >= SAMPLE_ROW_LIMIT + 1:
+                    break
+
+            if not collected:
+                previews.append({
+                    "name": sheet_name,
+                    "headers": None,
+                    "first_row_as_data": True,
+                    "dtypes": [],
+                    "row_count": 0,
+                    "sample_rows": [],
+                })
+                continue
+
+            # Read-only mode: max_row is the workbook's stored extent. For
+            # header-only sheets that's 1; for sheets with N data rows it's
+            # N+1 (header + data).
+            row_count_total = ws.max_row or len(collected)
+            headers = collected[0]
+            data_rows = collected[1:]
+            sample = data_rows[:SAMPLE_ROW_LIMIT]
+            data_count = max(row_count_total - 1, 0)
+            n_cols = len(headers)
+            dtypes = _column_dtypes(sample, n_cols)
+
+            previews.append({
+                "name": sheet_name,
+                "headers": headers,
+                "first_row_as_data": False,
+                "dtypes": dtypes,
+                "row_count": data_count,
+                "sample_rows": sample,
+            })
+    finally:
+        wb.close()
+
+    return previews
