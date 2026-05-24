@@ -504,6 +504,131 @@ def list_pending_descriptions(
     }
 
 
+def _submit_one_description(
+    *,
+    db_dir: str,
+    file_path: str,
+    sheet_name: str | None,
+    description: str,
+) -> dict:
+    """Embed and store one description chunk for a queued spreadsheet.
+
+    Shared between the submit_description MCP tool and the auto-drainer.
+    Returns {status, file_complete, reason?}. Does not raise on expected
+    rejection paths so tools can surface the reason verbatim.
+    """
+    import json as _json
+    from pathlib import Path
+    from server.store import VectorStore
+    from server.paths import to_relative
+    from server.indexer import embed_chunks, compute_file_hash
+    from server.chunker import _short_hash
+    from server.spreadsheets import MAX_DESCRIPTION_BYTES, needs_for_preview
+
+    path = Path(file_path)
+    if not path.exists():
+        return {"status": "rejected", "reason": "file_not_found"}
+
+    if not description or not description.strip():
+        return {"status": "rejected", "reason": "empty_description"}
+    if len(description.encode("utf-8")) > MAX_DESCRIPTION_BYTES:
+        return {"status": "rejected", "reason": "description_too_large"}
+
+    source_rel = to_relative(str(path), db_dir)
+    store = VectorStore(db_dir)
+    store.ensure_schema()
+
+    entry = store.get_pending_entry(source_rel)
+    if entry is None:
+        return {"status": "rejected", "reason": "not_pending"}
+
+    needed_item = "file" if sheet_name is None else f"sheet:{sheet_name}"
+    if needed_item not in entry["needs"]:
+        return {"status": "rejected", "reason": "item_not_needed"}
+
+    # chunk_index = position in the canonical needs order from the preview,
+    # so re-submissions don't collide and id = {file_hash}_{slot} stays stable.
+    preview = _json.loads(entry["preview_json"])
+    full_needs = needs_for_preview(preview)
+    slot = full_needs.index(needed_item)
+
+    stat = path.stat()
+    file_hash = compute_file_hash(path)
+    chunk_kind = "file_description" if sheet_name is None else "sheet_description"
+
+    chunk = {
+        "id": f"{_short_hash(source_rel)}_{slot}",
+        "text": description.strip(),
+        "source_file": source_rel,
+        "file_name": path.name,
+        "file_type": path.suffix.lower(),
+        "folder_path": os.path.dirname(source_rel) or ".",
+        "chunk_index": slot,
+        "content_hash": file_hash,
+        "mtime_ns": stat.st_mtime_ns,
+        "file_size": stat.st_size,
+        "chunk_kind": chunk_kind,
+        "sheet_name": sheet_name,
+    }
+    [chunk] = embed_chunks([chunk])
+    store.add_chunks([chunk])
+
+    remaining = [n for n in entry["needs"] if n != needed_item]
+    if not remaining:
+        store.remove_pending(source_rel)
+        return {"status": "stored", "file_complete": True}
+    store.update_pending_needs(source_rel, remaining)
+    return {"status": "stored", "file_complete": False}
+
+
+@mcp.tool(
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}
+)
+def submit_description(
+    file_path: Annotated[str, Field(description="Absolute path to the spreadsheet")],
+    sheet_name: Annotated[
+        str | None,
+        Field(
+            description="Name of the sheet being described. Pass null for "
+                        "the file-level rollup. For CSV, always pass null.",
+            default=None,
+        ),
+    ] = None,
+    description: Annotated[
+        str,
+        Field(description="The LLM-generated description text"),
+    ] = "",
+    db_path: Annotated[
+        str | None,
+        Field(
+            description="Path to the LanceDB database. Uses LANCEDB_PATH env var if omitted.",
+            default=None,
+        ),
+    ] = None,
+) -> dict:
+    """Store a description for a queued spreadsheet sheet or file-level rollup.
+
+    Embeds the description text and writes a chunk with chunk_kind set to
+    `sheet_description` (with sheet_name) or `file_description`. Updates the
+    matching pending-queue entry: removes the satisfied item, and when the
+    last item lands, removes the entry entirely (file_complete=true).
+
+    Returns one of:
+    - {"status": "stored", "file_complete": bool}
+    - {"status": "rejected", "reason": "file_not_found" | "empty_description"
+      | "description_too_large" | "not_pending" | "item_not_needed"}
+    """
+    if db_path is None:
+        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+    db_dir = os.path.abspath(db_path)
+    return _submit_one_description(
+        db_dir=db_dir,
+        file_path=file_path,
+        sheet_name=sheet_name,
+        description=description,
+    )
+
+
 def run():
     mcp.run()
 

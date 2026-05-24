@@ -581,3 +581,146 @@ async def test_list_pending_descriptions_auto_evicts_deleted_files(tmp_path):
     fresh = VectorStore(db)
     assert fresh.pending_count() == 0
 
+
+
+@pytest.mark.anyio
+async def test_submit_description_csv_completes_file(mock_model, tmp_path):
+    from server.store import VectorStore
+    from server.paths import to_relative
+
+    folder = tmp_path / "data"
+    folder.mkdir()
+    csv = folder / "x.csv"
+    csv.write_text("a,b\n1,2\n", encoding="utf-8")
+    db = str((tmp_path / "db").resolve())
+    rel = to_relative(str(csv), db)
+
+    store = VectorStore(db)
+    store.enqueue_pending(
+        rel, ["file"],
+        json.dumps({"type": "csv", "sheets": [{"name": "x.csv"}]}),
+        "h",
+    )
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "submit_description",
+            {
+                "file_path": str(csv),
+                "sheet_name": None,
+                "description": "This is a tiny customer-name list.",
+                "db_path": db,
+            },
+        )
+    data = json.loads(result.content[0].text)
+    assert data["status"] == "stored"
+    assert data["file_complete"] is True
+    fresh = VectorStore(db)
+    assert fresh.count_chunks() == 1
+    assert fresh.pending_count() == 0
+
+
+@pytest.mark.anyio
+async def test_submit_description_xlsx_incremental(mock_model, tmp_path):
+    import openpyxl
+    from server.store import VectorStore
+    from server.paths import to_relative
+
+    folder = tmp_path / "data"
+    folder.mkdir()
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    wb.create_sheet("Sales").append(["a", "b"])
+    wb.create_sheet("Costs").append(["c", "d"])
+    xlsx = folder / "biz.xlsx"
+    wb.save(xlsx)
+    db = str((tmp_path / "db").resolve())
+    rel = to_relative(str(xlsx), db)
+
+    store = VectorStore(db)
+    store.enqueue_pending(
+        rel,
+        ["sheet:Sales", "sheet:Costs", "file"],
+        json.dumps({"type": "xlsx", "sheets": [
+            {"name": "Sales"}, {"name": "Costs"},
+        ]}),
+        "h",
+    )
+
+    async with Client(mcp) as client:
+        r1 = await client.call_tool("submit_description", {
+            "file_path": str(xlsx), "sheet_name": "Sales",
+            "description": "Sales by region", "db_path": db,
+        })
+        d1 = json.loads(r1.content[0].text)
+        assert d1["file_complete"] is False
+
+        r2 = await client.call_tool("submit_description", {
+            "file_path": str(xlsx), "sheet_name": "Costs",
+            "description": "Costs by category", "db_path": db,
+        })
+        d2 = json.loads(r2.content[0].text)
+        assert d2["file_complete"] is False
+
+        r3 = await client.call_tool("submit_description", {
+            "file_path": str(xlsx), "sheet_name": None,
+            "description": "Sales and costs ledger.", "db_path": db,
+        })
+        d3 = json.loads(r3.content[0].text)
+        assert d3["file_complete"] is True
+
+    fresh = VectorStore(db)
+    assert fresh.count_chunks() == 3
+    assert fresh.pending_count() == 0
+
+
+@pytest.mark.anyio
+async def test_submit_description_rejects_unknown_sheet(mock_model, tmp_path):
+    from server.store import VectorStore
+    from server.paths import to_relative
+
+    folder = tmp_path / "data"
+    folder.mkdir()
+    csv = folder / "x.csv"
+    csv.write_text("a,b\n1,2\n", encoding="utf-8")
+    db = str((tmp_path / "db").resolve())
+    rel = to_relative(str(csv), db)
+
+    store = VectorStore(db)
+    store.enqueue_pending(
+        rel, ["file"], json.dumps({"type": "csv", "sheets": [{"name": "x.csv"}]}),
+        "h",
+    )
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("submit_description", {
+            "file_path": str(csv), "sheet_name": "NotInFile",
+            "description": "x", "db_path": db,
+        })
+    data = json.loads(result.content[0].text)
+    assert data["status"] == "rejected"
+    fresh = VectorStore(db)
+    assert fresh.pending_count() == 1
+
+
+@pytest.mark.anyio
+async def test_submit_description_rejects_empty(mock_model, tmp_path):
+    from server.store import VectorStore
+    from server.paths import to_relative
+
+    folder = tmp_path / "data"
+    folder.mkdir()
+    csv = folder / "x.csv"
+    csv.write_text("a,b\n1,2\n", encoding="utf-8")
+    db = str((tmp_path / "db").resolve())
+    rel = to_relative(str(csv), db)
+    VectorStore(db).enqueue_pending(rel, ["file"], "{}", "h")
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("submit_description", {
+            "file_path": str(csv), "sheet_name": None,
+            "description": "   ", "db_path": db,
+        })
+    data = json.loads(result.content[0].text)
+    assert data["status"] == "rejected"
+    assert data["reason"] == "empty_description"
