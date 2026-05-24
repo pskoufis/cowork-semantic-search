@@ -426,8 +426,39 @@ def reindex_file(
     source_rel = to_relative(str(path), db_dir)
 
     store = VectorStore(db_dir)
-    store.ensure_schema()  # migrate a pre-Tier-2 index in place, if needed
+    store.ensure_schema()  # migrate an older index in place, if needed
     store.delete_by_file(source_rel)
+
+    # Spreadsheet path: extract a preview, enqueue, and return. Description
+    # chunks land when the host LLM submits via submit_description (or when
+    # ctx.sample drains the queue — but reindex_file has no ctx).
+    from server.spreadsheets import (
+        SPREADSHEET_EXTENSIONS, UnreadableSpreadsheetError,
+        extract_preview, needs_for_preview,
+    )
+    import json as _json
+    if path.suffix.lower() in SPREADSHEET_EXTENSIONS:
+        try:
+            preview = extract_preview(path)
+        except UnreadableSpreadsheetError as exc:
+            return {
+                "status": "failed",
+                "file_path": file_path,
+                "reason": f"unreadable spreadsheet: {exc}",
+            }
+        file_hash = compute_file_hash(path)
+        needs = needs_for_preview(preview)
+        store.enqueue_pending(
+            file_path=source_rel,
+            needs=needs,
+            preview_json=_json.dumps(preview),
+            content_hash=file_hash,
+        )
+        return {
+            "status": "queued",
+            "file_path": file_path,
+            "needs": needs,
+        }
 
     parts = extract_text(path)
     chunks = chunk_document(parts, source_rel)

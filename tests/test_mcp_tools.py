@@ -782,3 +782,53 @@ async def test_dismiss_pending_description_rejects_missing_file(tmp_path):
     data = json.loads(result.content[0].text)
     assert data["status"] == "rejected"
     assert data["reason"] == "file_not_found"
+
+
+@pytest.mark.anyio
+async def test_reindex_file_routes_csv_to_queue(tmp_path):
+    from server.store import VectorStore
+    from server.paths import to_relative
+
+    folder = tmp_path / "data"; folder.mkdir()
+    csv = folder / "x.csv"
+    csv.write_text("a,b\n1,2\n", encoding="utf-8")
+    db = str((tmp_path / "db").resolve())
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("reindex_file", {
+            "file_path": str(csv), "db_path": db,
+        })
+    data = json.loads(result.content[0].text)
+    assert data["status"] == "queued"
+    assert data["needs"] == ["file"]
+    fresh = VectorStore(db)
+    assert fresh.pending_count() == 1
+    rel = to_relative(str(csv), db)
+    entry = fresh.get_pending_entry(rel)
+    assert entry["needs"] == ["file"]
+
+
+@pytest.mark.anyio
+async def test_reindex_file_routes_xlsx_to_queue(tmp_path):
+    import openpyxl
+    from server.store import VectorStore
+    from server.paths import to_relative
+
+    folder = tmp_path / "data"; folder.mkdir()
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    wb.create_sheet("S1").append(["a"])
+    wb.create_sheet("S2").append(["b"])
+    xlsx = folder / "biz.xlsx"
+    wb.save(xlsx)
+    db = str((tmp_path / "db").resolve())
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("reindex_file", {
+            "file_path": str(xlsx), "db_path": db,
+        })
+    data = json.loads(result.content[0].text)
+    assert data["status"] == "queued"
+    assert data["needs"] == ["sheet:S1", "sheet:S2", "file"]
+    fresh = VectorStore(db)
+    assert fresh.pending_count() == 1
