@@ -356,3 +356,73 @@ def test_add_chunks_persists_stat_fields(store):
     )
     assert rows[0]["mtime_ns"] == 12345
     assert rows[0]["file_size"] == 678
+
+
+# --- Spreadsheet description support ---
+
+
+# Pre-spreadsheet-descriptions schema (has stat fields, lacks chunk_kind/sheet_name).
+PRE_DESCRIPTIONS_SCHEMA = pa.schema([
+    pa.field("id", pa.string()),
+    pa.field("text", pa.string()),
+    pa.field("source_file", pa.string()),
+    pa.field("file_name", pa.string()),
+    pa.field("file_type", pa.string()),
+    pa.field("folder_path", pa.string()),
+    pa.field("chunk_index", pa.int32()),
+    pa.field("content_hash", pa.string()),
+    pa.field("mtime_ns", pa.int64()),
+    pa.field("file_size", pa.int64()),
+    pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
+])
+
+
+def test_schema_has_description_fields():
+    from server.store import SCHEMA
+    assert "chunk_kind" in SCHEMA.names
+    assert "sheet_name" in SCHEMA.names
+
+
+def test_ensure_schema_adds_chunk_kind_and_sheet_name(tmp_path):
+    """A pre-existing chunks table without the new columns gets them added;
+    existing rows are preserved."""
+    db_path = str(tmp_path / "db")
+    db = lancedb.connect(db_path)
+    table = db.create_table(TABLE_NAME, schema=PRE_DESCRIPTIONS_SCHEMA)
+    table.add([{
+        "id": "x_0", "text": "hi", "source_file": "a.txt",
+        "file_name": "a.txt", "file_type": ".txt", "folder_path": ".",
+        "chunk_index": 0, "content_hash": "deadbeef",
+        "mtime_ns": 0, "file_size": 2,
+        "vector": [0.0] * EMBEDDING_DIM,
+    }])
+
+    store = VectorStore(db_path)
+    store.ensure_schema()
+
+    names = set(store._get_table().schema.names)
+    assert "chunk_kind" in names
+    assert "sheet_name" in names
+    rows = store._get_table().search().limit(10).to_list()
+    assert any(r["id"] == "x_0" for r in rows)
+
+
+def test_add_chunks_persists_description_fields(store):
+    """add_chunks writes chunk_kind/sheet_name through to the table; missing
+    values default to chunk_kind='text' and sheet_name=null."""
+    chunks = _make_chunks(["plain text"])
+    desc_chunk = _make_chunks(["a sales workbook"], source_file="/f/biz.xlsx")[0]
+    desc_chunk["id"] = "desc_0"
+    desc_chunk["chunk_kind"] = "sheet_description"
+    desc_chunk["sheet_name"] = "Sales"
+    store.add_chunks(chunks + [desc_chunk])
+    rows = (
+        store._get_table().search()
+        .select(["id", "chunk_kind", "sheet_name"])
+        .limit(10).to_list()
+    )
+    rows_by_id = {r["id"]: r for r in rows}
+    assert rows_by_id["chunk_0"]["chunk_kind"] == "text"
+    assert rows_by_id["chunk_0"]["sheet_name"] is None
+    assert rows_by_id["desc_0"]["chunk_kind"] == "sheet_description"
+    assert rows_by_id["desc_0"]["sheet_name"] == "Sales"

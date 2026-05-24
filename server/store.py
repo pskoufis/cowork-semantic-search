@@ -25,6 +25,11 @@ SCHEMA = pa.schema([
     # unchanged files. int64 (not float st_mtime) for exact equality.
     pa.field("mtime_ns", pa.int64()),
     pa.field("file_size", pa.int64()),
+    # chunk_kind: "text" (default, NULL on legacy rows), "sheet_description",
+    # or "file_description". sheet_name is non-null only on sheet_description
+    # chunks. Both nullable so the in-place migration can backfill with NULL.
+    pa.field("chunk_kind", pa.string()),
+    pa.field("sheet_name", pa.string()),
     pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
 ])
 
@@ -82,23 +87,30 @@ class VectorStore:
             )
 
     def ensure_schema(self) -> None:
-        """Migrate a pre-Tier-2 index in place by adding any missing columns.
+        """Migrate an older index in place by adding any missing columns.
 
-        Adds mtime_ns / file_size (backfilled NULL) to a table that predates
-        them. Idempotent. Called only on write paths; the single-writer
+        Adds mtime_ns / file_size (Tier-2) and chunk_kind / sheet_name
+        (description support) to a table that predates them. All backfill to
+        NULL. Idempotent. Called only on write paths; the single-writer
         invariant guarantees no two callers race this migration.
         """
         table = self._get_table()
         if table is None:
             return  # fresh DB: _ensure_table creates with the current SCHEMA
         existing = set(table.schema.names)
-        missing = [
-            field for field in (
-                pa.field("mtime_ns", pa.int64()),
-                pa.field("file_size", pa.int64()),
-            )
-            if field.name not in existing
-        ]
+        # LanceDB add_columns takes {col_name: sql_expression}; CAST(NULL AS T)
+        # is the cheapest backfill. Application code treats NULL chunk_kind as
+        # equivalent to "text" downstream.
+        defaults = {
+            "mtime_ns": "CAST(NULL AS BIGINT)",
+            "file_size": "CAST(NULL AS BIGINT)",
+            "chunk_kind": "CAST(NULL AS STRING)",
+            "sheet_name": "CAST(NULL AS STRING)",
+        }
+        missing = {
+            name: expr for name, expr in defaults.items()
+            if name not in existing
+        }
         if missing:
             table.add_columns(missing)
             self._table = self._db.open_table(TABLE_NAME)  # refresh stale handle
@@ -118,6 +130,8 @@ class VectorStore:
                 "content_hash": c["content_hash"],
                 "mtime_ns": c["mtime_ns"],
                 "file_size": c["file_size"],
+                "chunk_kind": c.get("chunk_kind", "text"),
+                "sheet_name": c.get("sheet_name"),
                 "vector": c["vector"],
             })
         table.add(rows)
