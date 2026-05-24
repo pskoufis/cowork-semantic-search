@@ -724,3 +724,59 @@ async def test_submit_description_rejects_empty(mock_model, tmp_path):
     data = json.loads(result.content[0].text)
     assert data["status"] == "rejected"
     assert data["reason"] == "empty_description"
+
+
+@pytest.mark.anyio
+async def test_dismiss_pending_description_removes_and_records_hash(tmp_path):
+    from server.store import VectorStore
+    from server.paths import to_relative
+    from server.indexer import compute_file_hash
+
+    folder = tmp_path / "data"
+    folder.mkdir()
+    csv = folder / "junk.csv"
+    csv.write_text("a,b\n1,2\n", encoding="utf-8")
+    db = str((tmp_path / "db").resolve())
+    rel = to_relative(str(csv), db)
+    h = compute_file_hash(csv)
+
+    store = VectorStore(db)
+    store.enqueue_pending(rel, ["file"], json.dumps({"type": "csv"}), h)
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("dismiss_pending_description", {
+            "file_path": str(csv), "db_path": db,
+        })
+    data = json.loads(result.content[0].text)
+    assert data["status"] == "dismissed"
+    fresh = VectorStore(db)
+    assert fresh.pending_count() == 0
+    assert fresh.is_dismissed(rel, h)
+
+
+@pytest.mark.anyio
+async def test_dismiss_pending_description_rejects_unknown(tmp_path):
+    folder = tmp_path / "data"; folder.mkdir()
+    csv = folder / "x.csv"
+    csv.write_text("a,b\n1,2\n", encoding="utf-8")
+    db = str((tmp_path / "db").resolve())
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("dismiss_pending_description", {
+            "file_path": str(csv), "db_path": db,
+        })
+    data = json.loads(result.content[0].text)
+    assert data["status"] == "rejected"
+    assert data["reason"] == "not_pending"
+
+
+@pytest.mark.anyio
+async def test_dismiss_pending_description_rejects_missing_file(tmp_path):
+    db = str((tmp_path / "db").resolve())
+    async with Client(mcp) as client:
+        result = await client.call_tool("dismiss_pending_description", {
+            "file_path": str(tmp_path / "nope.csv"), "db_path": db,
+        })
+    data = json.loads(result.content[0].text)
+    assert data["status"] == "rejected"
+    assert data["reason"] == "file_not_found"

@@ -629,6 +629,56 @@ def submit_description(
     )
 
 
+@mcp.tool(
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}
+)
+def dismiss_pending_description(
+    file_path: Annotated[str, Field(description="Absolute path to the spreadsheet to dismiss")],
+    db_path: Annotated[
+        str | None,
+        Field(
+            description="Path to the LanceDB database. Uses LANCEDB_PATH env var if omitted.",
+            default=None,
+        ),
+    ] = None,
+) -> dict:
+    """Decline to describe a queued spreadsheet.
+
+    Removes the entry from the pending queue and records a dismissal keyed
+    by the file's current content hash. On future index_folder runs the
+    file is skipped silently as long as the hash matches; if the file's
+    content changes, the dismissal becomes stale and the file is
+    re-enqueued automatically.
+
+    Returns:
+    - {"status": "dismissed", "file_path": str}
+    - {"status": "rejected", "reason": "file_not_found" | "not_pending"}
+    """
+    from pathlib import Path
+    from server.store import VectorStore
+    from server.paths import to_relative
+    from server.indexer import compute_file_hash
+
+    path = Path(file_path)
+    if not path.exists():
+        return {"status": "rejected", "reason": "file_not_found"}
+
+    if db_path is None:
+        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+    db_dir = os.path.abspath(db_path)
+    source_rel = to_relative(str(path), db_dir)
+
+    store = VectorStore(db_dir)
+    entry = store.get_pending_entry(source_rel)
+    if entry is None:
+        return {"status": "rejected", "reason": "not_pending"}
+
+    file_hash = compute_file_hash(path)
+    store.remove_pending(source_rel)
+    store.dismiss(source_rel, file_hash)
+    return {"status": "dismissed", "file_path": file_path}
+
+
 def run():
     mcp.run()
 
