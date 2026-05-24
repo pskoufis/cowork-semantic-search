@@ -40,6 +40,18 @@ TABLE_NAME = "chunks"
 # codebook; above it is the regime an ANN index exists for.
 VECTOR_INDEX_MIN_ROWS = 20_000
 
+# Spreadsheet descriptions awaiting LLM-generated text. Stored in the same
+# LanceDB as `chunks` but as a separate table — no vectors, pure metadata.
+PENDING_TABLE_NAME = "pending_descriptions"
+
+PENDING_SCHEMA = pa.schema([
+    pa.field("file_path", pa.string()),
+    pa.field("needs", pa.list_(pa.string())),
+    pa.field("preview_json", pa.string()),
+    pa.field("content_hash", pa.string()),
+    pa.field("enqueued_at_ns", pa.int64()),
+])
+
 
 def _escape(value: str) -> str:
     """Double single quotes for safe interpolation into LanceDB where-clauses."""
@@ -381,3 +393,117 @@ class VectorStore:
             }
             for r in results
         ]
+
+    # --- pending_descriptions table ---------------------------------------
+
+    def _get_pending_table(self):
+        try:
+            return self._db.open_table(PENDING_TABLE_NAME)
+        except Exception:
+            return None
+
+    def _ensure_pending_table(self):
+        table = self._get_pending_table()
+        if table is None:
+            table = self._db.create_table(
+                PENDING_TABLE_NAME, schema=PENDING_SCHEMA
+            )
+        return table
+
+    def enqueue_pending(
+        self,
+        file_path: str,
+        needs: list[str],
+        preview_json: str,
+        content_hash: str,
+    ) -> None:
+        """Idempotent: any existing entry for this path is replaced."""
+        import time
+        table = self._ensure_pending_table()
+        table.delete(f"file_path = '{_escape(file_path)}'")
+        table.add([{
+            "file_path": file_path,
+            "needs": needs,
+            "preview_json": preview_json,
+            "content_hash": content_hash,
+            "enqueued_at_ns": time.time_ns(),
+        }])
+
+    def list_pending(
+        self, folder_path: str | None = None, limit: int = 20,
+    ) -> list[dict]:
+        table = self._get_pending_table()
+        if table is None or table.count_rows() == 0:
+            return []
+        query = table.search().limit(limit)
+        if folder_path is not None:
+            query = query.where(
+                f"file_path LIKE '{_escape(folder_path)}%'", prefilter=True,
+            )
+        return [
+            {
+                "file_path": r["file_path"],
+                "needs": list(r["needs"]),
+                "preview_json": r["preview_json"],
+                "content_hash": r["content_hash"],
+            }
+            for r in query.to_list()
+        ]
+
+    def remove_pending(self, file_path: str) -> None:
+        table = self._get_pending_table()
+        if table is None:
+            return
+        table.delete(f"file_path = '{_escape(file_path)}'")
+
+    def update_pending_needs(self, file_path: str, new_needs: list[str]) -> None:
+        """Rewrite an entry's `needs` list.
+
+        LanceDB doesn't support updating a list-typed column in place, so
+        we delete+reinsert, preserving the rest of the row."""
+        table = self._get_pending_table()
+        if table is None:
+            return
+        existing = (
+            table.search()
+            .where(f"file_path = '{_escape(file_path)}'", prefilter=True)
+            .limit(1)
+            .to_list()
+        )
+        if not existing:
+            return
+        row = existing[0]
+        table.delete(f"file_path = '{_escape(file_path)}'")
+        table.add([{
+            "file_path": row["file_path"],
+            "needs": new_needs,
+            "preview_json": row["preview_json"],
+            "content_hash": row["content_hash"],
+            "enqueued_at_ns": row["enqueued_at_ns"],
+        }])
+
+    def pending_count(self) -> int:
+        table = self._get_pending_table()
+        if table is None:
+            return 0
+        return table.count_rows()
+
+    def get_pending_entry(self, file_path: str) -> dict | None:
+        table = self._get_pending_table()
+        if table is None:
+            return None
+        rows = (
+            table.search()
+            .where(f"file_path = '{_escape(file_path)}'", prefilter=True)
+            .limit(1)
+            .to_list()
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "file_path": r["file_path"],
+            "needs": list(r["needs"]),
+            "preview_json": r["preview_json"],
+            "content_hash": r["content_hash"],
+        }

@@ -426,3 +426,69 @@ def test_add_chunks_persists_description_fields(store):
     assert rows_by_id["chunk_0"]["sheet_name"] is None
     assert rows_by_id["desc_0"]["chunk_kind"] == "sheet_description"
     assert rows_by_id["desc_0"]["sheet_name"] == "Sales"
+
+
+# --- pending_descriptions table ---
+
+
+def test_pending_descriptions_enqueue_list_remove(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    store.enqueue_pending(
+        file_path="folder/a.xlsx",
+        needs=["sheet:Sales", "sheet:Costs", "file"],
+        preview_json='{"type":"xlsx"}',
+        content_hash="hashA",
+    )
+    store.enqueue_pending(
+        file_path="folder/b.csv",
+        needs=["file"],
+        preview_json='{"type":"csv"}',
+        content_hash="hashB",
+    )
+    pending = store.list_pending(limit=10)
+    assert len(pending) == 2
+    paths = {p["file_path"] for p in pending}
+    assert paths == {"folder/a.xlsx", "folder/b.csv"}
+
+    store.remove_pending("folder/a.xlsx")
+    after = store.list_pending(limit=10)
+    assert {p["file_path"] for p in after} == {"folder/b.csv"}
+    assert store.pending_count() == 1
+
+
+def test_pending_descriptions_update_needs(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    store.enqueue_pending(
+        "x.xlsx", ["sheet:A", "sheet:B", "file"], "{}", "h",
+    )
+    store.update_pending_needs("x.xlsx", ["sheet:B", "file"])
+    [entry] = store.list_pending()
+    assert entry["needs"] == ["sheet:B", "file"]
+
+
+def test_pending_descriptions_get_entry(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    assert store.get_pending_entry("nope") is None
+    store.enqueue_pending(
+        "y.csv", ["file"], '{"type":"csv"}', "h",
+    )
+    entry = store.get_pending_entry("y.csv")
+    assert entry["needs"] == ["file"]
+    assert entry["content_hash"] == "h"
+
+
+def test_pending_descriptions_enqueue_is_idempotent(tmp_path):
+    """Re-enqueueing the same path replaces the existing entry."""
+    store = VectorStore(str(tmp_path / "db"))
+    store.enqueue_pending("x.csv", ["file"], '{}', "h1")
+    store.enqueue_pending("x.csv", ["file"], '{}', "h2")
+    assert store.pending_count() == 1
+    assert store.get_pending_entry("x.csv")["content_hash"] == "h2"
+
+
+def test_list_pending_filter_by_folder(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    store.enqueue_pending("a/x.csv", ["file"], "{}", "h")
+    store.enqueue_pending("b/y.csv", ["file"], "{}", "h")
+    res = store.list_pending(folder_path="a/", limit=10)
+    assert {r["file_path"] for r in res} == {"a/x.csv"}
