@@ -25,6 +25,11 @@ SCHEMA = pa.schema([
     # unchanged files. int64 (not float st_mtime) for exact equality.
     pa.field("mtime_ns", pa.int64()),
     pa.field("file_size", pa.int64()),
+    # chunk_kind: "text" (default, NULL on legacy rows), "sheet_description",
+    # or "file_description". sheet_name is non-null only on sheet_description
+    # chunks. Both nullable so the in-place migration can backfill with NULL.
+    pa.field("chunk_kind", pa.string()),
+    pa.field("sheet_name", pa.string()),
     pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
 ])
 
@@ -34,6 +39,29 @@ TABLE_NAME = "chunks"
 # scan is already sub-millisecond and IVF_PQ has too few rows to train a useful
 # codebook; above it is the regime an ANN index exists for.
 VECTOR_INDEX_MIN_ROWS = 20_000
+
+# Spreadsheet descriptions awaiting LLM-generated text. Stored in the same
+# LanceDB as `chunks` but as a separate table — no vectors, pure metadata.
+PENDING_TABLE_NAME = "pending_descriptions"
+
+PENDING_SCHEMA = pa.schema([
+    pa.field("file_path", pa.string()),
+    pa.field("needs", pa.list_(pa.string())),
+    pa.field("preview_json", pa.string()),
+    pa.field("content_hash", pa.string()),
+    pa.field("enqueued_at_ns", pa.int64()),
+])
+
+# A file the LLM has explicitly declined to describe. The content_hash is
+# captured at dismissal time so that if the file later changes, the
+# dismissal becomes stale and the file is re-enqueued.
+DISMISSED_TABLE_NAME = "dismissed_files"
+
+DISMISSED_SCHEMA = pa.schema([
+    pa.field("file_path", pa.string()),
+    pa.field("content_hash", pa.string()),
+    pa.field("dismissed_at_ns", pa.int64()),
+])
 
 
 def _escape(value: str) -> str:
@@ -82,23 +110,30 @@ class VectorStore:
             )
 
     def ensure_schema(self) -> None:
-        """Migrate a pre-Tier-2 index in place by adding any missing columns.
+        """Migrate an older index in place by adding any missing columns.
 
-        Adds mtime_ns / file_size (backfilled NULL) to a table that predates
-        them. Idempotent. Called only on write paths; the single-writer
+        Adds mtime_ns / file_size (Tier-2) and chunk_kind / sheet_name
+        (description support) to a table that predates them. All backfill to
+        NULL. Idempotent. Called only on write paths; the single-writer
         invariant guarantees no two callers race this migration.
         """
         table = self._get_table()
         if table is None:
             return  # fresh DB: _ensure_table creates with the current SCHEMA
         existing = set(table.schema.names)
-        missing = [
-            field for field in (
-                pa.field("mtime_ns", pa.int64()),
-                pa.field("file_size", pa.int64()),
-            )
-            if field.name not in existing
-        ]
+        # LanceDB add_columns takes {col_name: sql_expression}; CAST(NULL AS T)
+        # is the cheapest backfill. Application code treats NULL chunk_kind as
+        # equivalent to "text" downstream.
+        defaults = {
+            "mtime_ns": "CAST(NULL AS BIGINT)",
+            "file_size": "CAST(NULL AS BIGINT)",
+            "chunk_kind": "CAST(NULL AS STRING)",
+            "sheet_name": "CAST(NULL AS STRING)",
+        }
+        missing = {
+            name: expr for name, expr in defaults.items()
+            if name not in existing
+        }
         if missing:
             table.add_columns(missing)
             self._table = self._db.open_table(TABLE_NAME)  # refresh stale handle
@@ -118,6 +153,8 @@ class VectorStore:
                 "content_hash": c["content_hash"],
                 "mtime_ns": c["mtime_ns"],
                 "file_size": c["file_size"],
+                "chunk_kind": c.get("chunk_kind", "text"),
+                "sheet_name": c.get("sheet_name"),
                 "vector": c["vector"],
             })
         table.add(rows)
@@ -367,3 +404,200 @@ class VectorStore:
             }
             for r in results
         ]
+
+    # --- pending_descriptions table ---------------------------------------
+
+    def _get_pending_table(self):
+        try:
+            return self._db.open_table(PENDING_TABLE_NAME)
+        except Exception:
+            return None
+
+    def _ensure_pending_table(self):
+        table = self._get_pending_table()
+        if table is None:
+            table = self._db.create_table(
+                PENDING_TABLE_NAME, schema=PENDING_SCHEMA
+            )
+        return table
+
+    def enqueue_pending(
+        self,
+        file_path: str,
+        needs: list[str],
+        preview_json: str,
+        content_hash: str,
+    ) -> None:
+        """Idempotent: any existing entry for this path is replaced."""
+        import time
+        table = self._ensure_pending_table()
+        table.delete(f"file_path = '{_escape(file_path)}'")
+        table.add([{
+            "file_path": file_path,
+            "needs": needs,
+            "preview_json": preview_json,
+            "content_hash": content_hash,
+            "enqueued_at_ns": time.time_ns(),
+        }])
+
+    def list_pending(
+        self, folder_path: str | None = None, limit: int = 20,
+    ) -> list[dict]:
+        table = self._get_pending_table()
+        if table is None or table.count_rows() == 0:
+            return []
+        query = table.search().limit(limit)
+        if folder_path is not None:
+            query = query.where(
+                f"file_path LIKE '{_escape(folder_path)}%'", prefilter=True,
+            )
+        return [
+            {
+                "file_path": r["file_path"],
+                "needs": list(r["needs"]),
+                "preview_json": r["preview_json"],
+                "content_hash": r["content_hash"],
+            }
+            for r in query.to_list()
+        ]
+
+    def remove_pending(self, file_path: str) -> None:
+        table = self._get_pending_table()
+        if table is None:
+            return
+        table.delete(f"file_path = '{_escape(file_path)}'")
+
+    def update_pending_needs(self, file_path: str, new_needs: list[str]) -> None:
+        """Rewrite an entry's `needs` list.
+
+        LanceDB doesn't support updating a list-typed column in place, so
+        we delete+reinsert, preserving the rest of the row."""
+        table = self._get_pending_table()
+        if table is None:
+            return
+        existing = (
+            table.search()
+            .where(f"file_path = '{_escape(file_path)}'", prefilter=True)
+            .limit(1)
+            .to_list()
+        )
+        if not existing:
+            return
+        row = existing[0]
+        table.delete(f"file_path = '{_escape(file_path)}'")
+        table.add([{
+            "file_path": row["file_path"],
+            "needs": new_needs,
+            "preview_json": row["preview_json"],
+            "content_hash": row["content_hash"],
+            "enqueued_at_ns": row["enqueued_at_ns"],
+        }])
+
+    def pending_count(self) -> int:
+        table = self._get_pending_table()
+        if table is None:
+            return 0
+        return table.count_rows()
+
+    def get_pending_entry(self, file_path: str) -> dict | None:
+        table = self._get_pending_table()
+        if table is None:
+            return None
+        rows = (
+            table.search()
+            .where(f"file_path = '{_escape(file_path)}'", prefilter=True)
+            .limit(1)
+            .to_list()
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "file_path": r["file_path"],
+            "needs": list(r["needs"]),
+            "preview_json": r["preview_json"],
+            "content_hash": r["content_hash"],
+        }
+
+    # --- dismissed_files table --------------------------------------------
+
+    def _get_dismissed_table(self):
+        try:
+            return self._db.open_table(DISMISSED_TABLE_NAME)
+        except Exception:
+            return None
+
+    def _ensure_dismissed_table(self):
+        table = self._get_dismissed_table()
+        if table is None:
+            table = self._db.create_table(
+                DISMISSED_TABLE_NAME, schema=DISMISSED_SCHEMA
+            )
+        return table
+
+    def dismiss(self, file_path: str, content_hash: str) -> None:
+        """Record a dismissal. Replaces any prior dismissal of the same path."""
+        import time
+        table = self._ensure_dismissed_table()
+        table.delete(f"file_path = '{_escape(file_path)}'")
+        table.add([{
+            "file_path": file_path,
+            "content_hash": content_hash,
+            "dismissed_at_ns": time.time_ns(),
+        }])
+
+    def is_dismissed(self, file_path: str, content_hash: str) -> bool:
+        table = self._get_dismissed_table()
+        if table is None:
+            return False
+        rows = (
+            table.search()
+            .where(
+                f"file_path = '{_escape(file_path)}' AND "
+                f"content_hash = '{_escape(content_hash)}'",
+                prefilter=True,
+            )
+            .limit(1)
+            .to_list()
+        )
+        return bool(rows)
+
+    def clear_dismissal(self, file_path: str) -> None:
+        table = self._get_dismissed_table()
+        if table is None:
+            return
+        table.delete(f"file_path = '{_escape(file_path)}'")
+
+    # --- one-shot legacy eviction -----------------------------------------
+
+    def evict_legacy_spreadsheet_chunks(self) -> set[str]:
+        """Delete any CSV/XLSX chunks stored under the legacy raw-row scheme.
+
+        Legacy = chunk_kind IS NULL OR chunk_kind = 'text'. Description
+        chunks (sheet_description, file_description) are left alone.
+
+        Returns the set of source_file paths whose chunks were evicted so
+        the caller can force re-processing on the next pass even when the
+        content hash hasn't changed.
+        """
+        table = self._get_table()
+        if table is None:
+            return set()
+        n = table.count_rows()
+        if n == 0:
+            return set()
+        legacy_predicate = (
+            "(file_type = '.csv' OR file_type = '.xlsx') AND "
+            "(chunk_kind IS NULL OR chunk_kind = 'text')"
+        )
+        rows = (
+            table.search()
+            .where(legacy_predicate, prefilter=True)
+            .select(["source_file"])
+            .limit(n)
+            .to_list()
+        )
+        affected = {r["source_file"] for r in rows}
+        if affected:
+            table.delete(legacy_predicate)
+        return affected

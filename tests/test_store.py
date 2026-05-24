@@ -356,3 +356,207 @@ def test_add_chunks_persists_stat_fields(store):
     )
     assert rows[0]["mtime_ns"] == 12345
     assert rows[0]["file_size"] == 678
+
+
+# --- Spreadsheet description support ---
+
+
+# Pre-spreadsheet-descriptions schema (has stat fields, lacks chunk_kind/sheet_name).
+PRE_DESCRIPTIONS_SCHEMA = pa.schema([
+    pa.field("id", pa.string()),
+    pa.field("text", pa.string()),
+    pa.field("source_file", pa.string()),
+    pa.field("file_name", pa.string()),
+    pa.field("file_type", pa.string()),
+    pa.field("folder_path", pa.string()),
+    pa.field("chunk_index", pa.int32()),
+    pa.field("content_hash", pa.string()),
+    pa.field("mtime_ns", pa.int64()),
+    pa.field("file_size", pa.int64()),
+    pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
+])
+
+
+def test_schema_has_description_fields():
+    from server.store import SCHEMA
+    assert "chunk_kind" in SCHEMA.names
+    assert "sheet_name" in SCHEMA.names
+
+
+def test_ensure_schema_adds_chunk_kind_and_sheet_name(tmp_path):
+    """A pre-existing chunks table without the new columns gets them added;
+    existing rows are preserved."""
+    db_path = str(tmp_path / "db")
+    db = lancedb.connect(db_path)
+    table = db.create_table(TABLE_NAME, schema=PRE_DESCRIPTIONS_SCHEMA)
+    table.add([{
+        "id": "x_0", "text": "hi", "source_file": "a.txt",
+        "file_name": "a.txt", "file_type": ".txt", "folder_path": ".",
+        "chunk_index": 0, "content_hash": "deadbeef",
+        "mtime_ns": 0, "file_size": 2,
+        "vector": [0.0] * EMBEDDING_DIM,
+    }])
+
+    store = VectorStore(db_path)
+    store.ensure_schema()
+
+    names = set(store._get_table().schema.names)
+    assert "chunk_kind" in names
+    assert "sheet_name" in names
+    rows = store._get_table().search().limit(10).to_list()
+    assert any(r["id"] == "x_0" for r in rows)
+
+
+def test_add_chunks_persists_description_fields(store):
+    """add_chunks writes chunk_kind/sheet_name through to the table; missing
+    values default to chunk_kind='text' and sheet_name=null."""
+    chunks = _make_chunks(["plain text"])
+    desc_chunk = _make_chunks(["a sales workbook"], source_file="/f/biz.xlsx")[0]
+    desc_chunk["id"] = "desc_0"
+    desc_chunk["chunk_kind"] = "sheet_description"
+    desc_chunk["sheet_name"] = "Sales"
+    store.add_chunks(chunks + [desc_chunk])
+    rows = (
+        store._get_table().search()
+        .select(["id", "chunk_kind", "sheet_name"])
+        .limit(10).to_list()
+    )
+    rows_by_id = {r["id"]: r for r in rows}
+    assert rows_by_id["chunk_0"]["chunk_kind"] == "text"
+    assert rows_by_id["chunk_0"]["sheet_name"] is None
+    assert rows_by_id["desc_0"]["chunk_kind"] == "sheet_description"
+    assert rows_by_id["desc_0"]["sheet_name"] == "Sales"
+
+
+# --- pending_descriptions table ---
+
+
+def test_pending_descriptions_enqueue_list_remove(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    store.enqueue_pending(
+        file_path="folder/a.xlsx",
+        needs=["sheet:Sales", "sheet:Costs", "file"],
+        preview_json='{"type":"xlsx"}',
+        content_hash="hashA",
+    )
+    store.enqueue_pending(
+        file_path="folder/b.csv",
+        needs=["file"],
+        preview_json='{"type":"csv"}',
+        content_hash="hashB",
+    )
+    pending = store.list_pending(limit=10)
+    assert len(pending) == 2
+    paths = {p["file_path"] for p in pending}
+    assert paths == {"folder/a.xlsx", "folder/b.csv"}
+
+    store.remove_pending("folder/a.xlsx")
+    after = store.list_pending(limit=10)
+    assert {p["file_path"] for p in after} == {"folder/b.csv"}
+    assert store.pending_count() == 1
+
+
+def test_pending_descriptions_update_needs(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    store.enqueue_pending(
+        "x.xlsx", ["sheet:A", "sheet:B", "file"], "{}", "h",
+    )
+    store.update_pending_needs("x.xlsx", ["sheet:B", "file"])
+    [entry] = store.list_pending()
+    assert entry["needs"] == ["sheet:B", "file"]
+
+
+def test_pending_descriptions_get_entry(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    assert store.get_pending_entry("nope") is None
+    store.enqueue_pending(
+        "y.csv", ["file"], '{"type":"csv"}', "h",
+    )
+    entry = store.get_pending_entry("y.csv")
+    assert entry["needs"] == ["file"]
+    assert entry["content_hash"] == "h"
+
+
+def test_pending_descriptions_enqueue_is_idempotent(tmp_path):
+    """Re-enqueueing the same path replaces the existing entry."""
+    store = VectorStore(str(tmp_path / "db"))
+    store.enqueue_pending("x.csv", ["file"], '{}', "h1")
+    store.enqueue_pending("x.csv", ["file"], '{}', "h2")
+    assert store.pending_count() == 1
+    assert store.get_pending_entry("x.csv")["content_hash"] == "h2"
+
+
+def test_list_pending_filter_by_folder(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    store.enqueue_pending("a/x.csv", ["file"], "{}", "h")
+    store.enqueue_pending("b/y.csv", ["file"], "{}", "h")
+    res = store.list_pending(folder_path="a/", limit=10)
+    assert {r["file_path"] for r in res} == {"a/x.csv"}
+
+
+# --- dismissed_files + legacy eviction ---
+
+
+def test_dismissal_lifecycle(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    assert not store.is_dismissed("x.csv", "hashA")
+    store.dismiss("x.csv", "hashA")
+    assert store.is_dismissed("x.csv", "hashA")
+    # different hash = not dismissed (file content changed since dismissal)
+    assert not store.is_dismissed("x.csv", "hashB")
+    store.clear_dismissal("x.csv")
+    assert not store.is_dismissed("x.csv", "hashA")
+
+
+def test_dismissal_replaces_existing(tmp_path):
+    """Re-dismissing the same path replaces the prior hash."""
+    store = VectorStore(str(tmp_path / "db"))
+    store.dismiss("x.csv", "h1")
+    store.dismiss("x.csv", "h2")
+    assert not store.is_dismissed("x.csv", "h1")
+    assert store.is_dismissed("x.csv", "h2")
+
+
+def test_evict_legacy_spreadsheet_chunks(tmp_path):
+    store = VectorStore(str(tmp_path / "db"))
+    # Seed: 2 CSV legacy text chunks, 1 PDF text chunk, 1 CSV description chunk.
+    base = _make_chunks(
+        ["row data"], source_file="a.csv", file_hash="h", mtime_ns=0, file_size=1,
+    )[0]
+    base["file_type"] = ".csv"
+    base["file_name"] = "a.csv"
+
+    second = _make_chunks(
+        ["more rows"], source_file="b.csv", file_hash="h", mtime_ns=0, file_size=1,
+    )[0]
+    second["id"] = "csv_1"
+    second["file_type"] = ".csv"
+    second["file_name"] = "b.csv"
+
+    pdf = _make_chunks(
+        ["pdf content"], source_file="c.pdf", file_hash="h", mtime_ns=0, file_size=1,
+    )[0]
+    pdf["id"] = "pdf_0"
+    pdf["file_type"] = ".pdf"
+    pdf["file_name"] = "c.pdf"
+
+    csv_desc = _make_chunks(
+        ["a sales export"], source_file="d.csv", file_hash="h",
+        mtime_ns=0, file_size=1,
+    )[0]
+    csv_desc["id"] = "csv_desc"
+    csv_desc["file_type"] = ".csv"
+    csv_desc["file_name"] = "d.csv"
+    csv_desc["chunk_kind"] = "file_description"
+
+    store.add_chunks([base, second, pdf, csv_desc])
+    evicted = store.evict_legacy_spreadsheet_chunks()
+    assert evicted == {"a.csv", "b.csv"}
+    remaining_files = set(store.get_all_files())
+    assert remaining_files == {"c.pdf", "d.csv"}
+
+
+def test_evict_legacy_spreadsheet_chunks_empty_store(tmp_path):
+    """Eviction on a fresh DB without the chunks table is a no-op."""
+    store = VectorStore(str(tmp_path / "db"))
+    assert store.evict_legacy_spreadsheet_chunks() == set()

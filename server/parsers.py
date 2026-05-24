@@ -1,20 +1,26 @@
-"""Per-format text extraction from document files."""
+"""Per-format text extraction from document files.
 
-import csv
-import io
+CSV and XLSX are listed in SUPPORTED_EXTENSIONS so discover_files surfaces
+them, but they are deliberately routed by server/indexer.py to the
+description-queue path (server.spreadsheets) instead of through
+extract_text. extract_text raises for them so a stray caller can't fall
+back into the old raw-row scheme.
+"""
+
 import re
 import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx", ".pptx", ".csv", ".pst"}
+SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx", ".pptx", ".csv", ".xlsx", ".pst"}
 
 
 def extract_text(file_path: Path) -> list[dict]:
     """Extract text from a file, returning list of {text, metadata} dicts.
 
     Metadata may include page_number (PDF), slide_number (PPTX),
-    pst_folder (PST).
+    pst_folder (PST). Spreadsheets are not handled here — see the module
+    docstring.
     """
     suffix = file_path.suffix.lower()
 
@@ -28,14 +34,13 @@ def extract_text(file_path: Path) -> list[dict]:
             return _extract_docx(file_path)
         case ".pptx":
             return _extract_pptx(file_path)
-        case ".csv":
-            return _extract_csv(file_path)
         case ".pst":
             return _extract_pst(file_path)
         case _:
             raise ValueError(
                 f"Unsupported file type: {suffix}. "
-                f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+                f"Supported via extract_text: .txt, .md, .pdf, .docx, .pptx, "
+                f".pst. CSV/XLSX route through server.spreadsheets."
             )
 
 
@@ -74,14 +79,6 @@ def _extract_pptx(file_path: Path) -> list[dict]:
             "metadata": {"slide_number": slide_num},
         })
     return parts
-
-
-def _extract_csv(file_path: Path) -> list[dict]:
-    raw = file_path.read_text(encoding="utf-8", errors="replace")
-    reader = csv.reader(io.StringIO(raw))
-    rows = list(reader)
-    text = "\n".join(", ".join(row) for row in rows)
-    return [{"text": text, "metadata": {}}]
 
 
 # --- PST (Outlook archive) extraction --------------------------------------
