@@ -132,3 +132,95 @@ def test_xlsx_preview_unreadable_file(tmp_path: Path):
     bad.write_bytes(b"not actually a zip")
     with pytest.raises(UnreadableSpreadsheetError):
         _extract_xlsx_preview(bad)
+
+
+# --- Dispatcher + prompt builders ------------------------------------------
+
+from server.spreadsheets import (
+    extract_preview,
+    build_sheet_prompt,
+    build_file_prompt,
+    needs_for_preview,
+    SPREADSHEET_EXTENSIONS,
+)
+
+
+def test_extract_preview_csv(tmp_path: Path):
+    csv = _write(tmp_path, "x.csv", "a,b\n1,2\n3,4\n")
+    pv = extract_preview(csv)
+    assert pv["type"] == "csv"
+    assert len(pv["sheets"]) == 1
+    assert pv["sheets"][0]["headers"] == ["a", "b"]
+
+
+def test_extract_preview_xlsx(tmp_path: Path):
+    xlsx = _build_xlsx(tmp_path, "x.xlsx", {"S": [["a", "b"], [1, 2]]})
+    pv = extract_preview(xlsx)
+    assert pv["type"] == "xlsx"
+    assert pv["sheets"][0]["name"] == "S"
+
+
+def test_extract_preview_rejects_unknown(tmp_path: Path):
+    p = _write(tmp_path, "x.txt", "hello")
+    with pytest.raises(ValueError):
+        extract_preview(p)
+
+
+def test_supported_extensions_constant():
+    assert ".csv" in SPREADSHEET_EXTENSIONS
+    assert ".xlsx" in SPREADSHEET_EXTENSIONS
+
+
+def test_needs_for_csv():
+    pv = {"type": "csv", "sheets": [{"name": "x.csv"}]}
+    assert needs_for_preview(pv) == ["file"]
+
+
+def test_needs_for_xlsx():
+    pv = {"type": "xlsx", "sheets": [{"name": "Sales"}, {"name": "Costs"}]}
+    assert needs_for_preview(pv) == ["sheet:Sales", "sheet:Costs", "file"]
+
+
+def test_build_sheet_prompt_includes_context():
+    pv = {"type": "xlsx", "sheets": [{
+        "name": "Sales",
+        "headers": ["region", "qty"],
+        "dtypes": ["string", "number"],
+        "row_count": 1000,
+        "sample_rows": [["EMEA", "10"]],
+        "first_row_as_data": False,
+    }]}
+    prompt = build_sheet_prompt(pv, "Sales")
+    assert "Sales" in prompt
+    assert "region" in prompt
+    assert "qty" in prompt
+    assert "1000" in prompt
+    assert "EMEA" in prompt
+
+
+def test_build_file_prompt_includes_sheet_descriptions():
+    pv = {"type": "xlsx", "sheets": [
+        {"name": "Sales", "headers": ["a"], "dtypes": ["string"],
+         "row_count": 1, "sample_rows": [], "first_row_as_data": False},
+        {"name": "Costs", "headers": ["b"], "dtypes": ["string"],
+         "row_count": 1, "sample_rows": [], "first_row_as_data": False},
+    ]}
+    descs = {"Sales": "Tracks sales by region.", "Costs": "Lists expenses."}
+    prompt = build_file_prompt(pv, descs)
+    assert "Tracks sales by region." in prompt
+    assert "Lists expenses." in prompt
+
+
+def test_build_file_prompt_csv_uses_single_sheet_block():
+    pv = {"type": "csv", "sheets": [{
+        "name": "data.csv",
+        "headers": ["id", "name"],
+        "dtypes": ["number", "string"],
+        "row_count": 42,
+        "sample_rows": [["1", "alice"]],
+        "first_row_as_data": False,
+    }]}
+    prompt = build_file_prompt(pv, {})
+    assert "data.csv" in prompt
+    assert "42" in prompt
+    assert "alice" in prompt

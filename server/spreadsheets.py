@@ -180,3 +180,92 @@ def _extract_xlsx_preview(file_path: Path) -> list[dict]:
         wb.close()
 
     return previews
+
+
+def extract_preview(file_path: Path) -> dict:
+    """Build the full preview dict for a spreadsheet.
+
+    Returns {"type": "csv"|"xlsx", "sheets": [sheet_preview, ...]}.
+    CSV has exactly one sheet (using the file name). XLSX has one entry
+    per worksheet.
+
+    Raises ValueError for unsupported extensions; UnreadableSpreadsheetError
+    for files that can't be opened.
+    """
+    suffix = file_path.suffix.lower()
+    if suffix == ".csv":
+        return {"type": "csv", "sheets": [_extract_csv_preview(file_path)]}
+    if suffix == ".xlsx":
+        return {"type": "xlsx", "sheets": _extract_xlsx_preview(file_path)}
+    raise ValueError(f"Not a spreadsheet: {suffix}")
+
+
+def needs_for_preview(preview: dict) -> list[str]:
+    """Derive the queue's `needs` list from a preview.
+
+    CSV → one file-level description (the CSV *is* its single sheet, so we
+    skip the redundant sheet-level description). XLSX → one description
+    per sheet plus a file-level rollup.
+    """
+    if preview["type"] == "csv":
+        return ["file"]
+    return [f"sheet:{s['name']}" for s in preview["sheets"]] + ["file"]
+
+
+def _format_sheet_block(sheet: dict) -> str:
+    """Render a single sheet's preview as a markdown-ish block for prompts."""
+    headers = sheet["headers"]
+    header_line = (
+        f"Headers: {headers}" if headers
+        else "Headers: (none detected — first row is data)"
+    )
+    if headers:
+        n_cols = len(headers)
+    elif sheet["sample_rows"]:
+        n_cols = len(sheet["sample_rows"][0])
+    else:
+        n_cols = 0
+    sample_lines = "\n".join(
+        f"  {row}" for row in sheet["sample_rows"][:SAMPLE_ROW_LIMIT]
+    ) or "  (no sample rows)"
+    return (
+        f"Sheet: {sheet['name']}\n"
+        f"Rows: {sheet['row_count']}, Columns: {n_cols}\n"
+        f"{header_line}\n"
+        f"Dtypes: {sheet['dtypes']}\n"
+        f"Sample:\n{sample_lines}"
+    )
+
+
+def build_sheet_prompt(preview: dict, sheet_name: str) -> str:
+    """LLM prompt for a single sheet's description."""
+    sheet = next(s for s in preview["sheets"] if s["name"] == sheet_name)
+    return (
+        "You are describing one sheet from a spreadsheet so that another "
+        "system can later retrieve it by topic. Write a 1–3 sentence "
+        "description of what this sheet contains and what it's used for. "
+        "Focus on subject matter, not column-level mechanics. No preamble.\n\n"
+        f"{_format_sheet_block(sheet)}"
+    )
+
+
+def build_file_prompt(preview: dict, sheet_descriptions: dict[str, str]) -> str:
+    """LLM prompt for the file-level rollup description."""
+    if preview["type"] == "csv":
+        sheet = preview["sheets"][0]
+        return (
+            "You are describing a CSV file so that another system can later "
+            "retrieve it by topic. Write a 1–3 sentence description of what "
+            "this file contains and what it's used for. No preamble.\n\n"
+            f"{_format_sheet_block(sheet)}"
+        )
+    desc_lines = "\n".join(
+        f"- {name}: {desc}" for name, desc in sheet_descriptions.items()
+    )
+    return (
+        "You are writing the file-level summary for a multi-sheet workbook "
+        "so that another system can retrieve it by topic. Write a 2–4 "
+        "sentence description of the workbook's purpose and the relationship "
+        "between its sheets. No preamble.\n\n"
+        f"Sheets and their descriptions:\n{desc_lines}"
+    )
