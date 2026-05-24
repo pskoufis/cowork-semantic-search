@@ -4,10 +4,16 @@ import asyncio
 import os
 from typing import Annotated
 
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 from pydantic import Field
 
 mcp = FastMCP("Semantic Search")
+
+# How long to wait between a failed ctx.sample call and its one retry.
+# Module-level so tests can monkeypatch it to 0 and not spend seconds in
+# backoff. Not env-configurable on purpose — the spec calls for a hard-coded
+# value.
+_SAMPLE_RETRY_BACKOFF_SECONDS = 2.0
 
 
 def _human_size(num_bytes: int) -> str:
@@ -19,13 +25,17 @@ def _human_size(num_bytes: int) -> str:
         size /= 1024
 
 
-async def _run_index_job(job, file_types, recursive, exclude) -> None:
+async def _run_index_job(job, file_types, recursive, exclude, ctx=None) -> None:
     """Run the synchronous index_folder in a worker thread, recording progress
     and the final outcome on the job record.
 
     The CPU-bound embedding work runs off the event loop via asyncio.to_thread.
     Any exception is captured onto the job so it never silently hangs in the
     'running' state.
+
+    After indexing, if the client supports MCP sampling, auto-drains any
+    spreadsheet description requests via ctx.sample(). Failures leave entries
+    in the queue for the host LLM to drain manually via submit_description.
     """
     from server.jobs import registry
     from server.indexer import index_folder as _index_folder
@@ -43,6 +53,9 @@ async def _run_index_job(job, file_types, recursive, exclude) -> None:
             progress,
             exclude,
         )
+        if ctx is not None and result.get("descriptions_queued", 0) > 0:
+            sampled = await _auto_drain_descriptions(job.db_path, ctx)
+            result["descriptions_sampled"] = sampled
         registry.mark_completed(
             job.job_id, result, result.get("finalize_warnings", [])
         )
@@ -89,6 +102,7 @@ async def index_folder(
             default=None,
         ),
     ] = None,
+    ctx: Context = None,
 ) -> dict:
     """Start a background job to index or re-index all documents in a folder.
 
@@ -150,7 +164,7 @@ async def index_folder(
 
     job = registry.create(folder_path, db_dir)
     job.task = asyncio.create_task(
-        _run_index_job(job, file_types, recursive, exclude)
+        _run_index_job(job, file_types, recursive, exclude, ctx=ctx)
     )
     return {
         "status": "started",
@@ -579,6 +593,164 @@ def _submit_one_description(
         return {"status": "stored", "file_complete": True}
     store.update_pending_needs(source_rel, remaining)
     return {"status": "stored", "file_complete": False}
+
+
+async def _sample_with_retry(ctx, prompt: str) -> str | None:
+    """Call ctx.sample with one retry. Returns the description text on
+    success, None on permanent failure (caller treats None as 'abort this
+    file's commit and leave its queue entry alone').
+
+    Rejects empty / too-large responses up front so a sloppy LLM reply
+    doesn't pollute the index.
+    """
+    from server.spreadsheets import MAX_DESCRIPTION_BYTES
+
+    for attempt in range(2):
+        try:
+            result = await ctx.sample(prompt)
+            text = getattr(result, "text", None)
+            if text is None:
+                text = str(result)
+            text = text.strip()
+            if not text:
+                raise ValueError("empty sampling response")
+            if len(text.encode("utf-8")) > MAX_DESCRIPTION_BYTES:
+                raise ValueError("sampling response over size cap")
+            return text
+        except Exception:
+            if attempt == 0:
+                await asyncio.sleep(_SAMPLE_RETRY_BACKOFF_SECONDS)
+                continue
+            return None
+    return None
+
+
+def _build_description_chunk(
+    *,
+    db_dir: str,
+    abs_path,
+    source_rel: str,
+    content_hash: str,
+    slot: int,
+    description: str,
+    chunk_kind: str,
+    sheet_name: str | None,
+) -> dict:
+    """Build a description chunk dict ready for embed_chunks + add_chunks."""
+    from server.chunker import _short_hash
+
+    stat = abs_path.stat()
+    return {
+        "id": f"{_short_hash(source_rel)}_{slot}",
+        "text": description,
+        "source_file": source_rel,
+        "file_name": abs_path.name,
+        "file_type": abs_path.suffix.lower(),
+        "folder_path": os.path.dirname(source_rel) or ".",
+        "chunk_index": slot,
+        "content_hash": content_hash,
+        "mtime_ns": stat.st_mtime_ns,
+        "file_size": stat.st_size,
+        "chunk_kind": chunk_kind,
+        "sheet_name": sheet_name,
+    }
+
+
+async def _auto_drain_descriptions(db_dir: str, ctx) -> int:
+    """Drain the pending_descriptions queue via ctx.sample().
+
+    Per-file atomic commit: all of a file's descriptions are buffered and
+    written together only if every sample succeeds. On any failure inside a
+    file, the buffer is discarded and the queue entry stays for manual
+    drain later — a workbook is never half-sampled half-queued.
+
+    Returns the number of description chunks actually written.
+    """
+    import json as _json
+    from pathlib import Path
+    from server.store import VectorStore
+    from server.paths import to_absolute
+    from server.indexer import embed_chunks
+    from server.spreadsheets import (
+        build_sheet_prompt, build_file_prompt, needs_for_preview,
+    )
+
+    store = VectorStore(db_dir)
+    written = 0
+    failed_paths: set[str] = set()
+
+    while True:
+        batch = [
+            e for e in store.list_pending(limit=20)
+            if e["file_path"] not in failed_paths
+        ]
+        if not batch:
+            break
+        for entry in batch:
+            preview = _json.loads(entry["preview_json"])
+            abs_path = Path(to_absolute(entry["file_path"], db_dir))
+            if not abs_path.exists():
+                store.remove_pending(entry["file_path"])
+                continue
+
+            full_needs = needs_for_preview(preview)
+            sheet_descriptions: dict[str, str] = {}
+            chunks: list[dict] = []
+            aborted = False
+
+            # Per-sheet first
+            for slot, item in enumerate(full_needs):
+                if item == "file":
+                    continue
+                sheet_name = item.removeprefix("sheet:")
+                desc = await _sample_with_retry(
+                    ctx, build_sheet_prompt(preview, sheet_name)
+                )
+                if desc is None:
+                    aborted = True
+                    break
+                sheet_descriptions[sheet_name] = desc
+                chunks.append(_build_description_chunk(
+                    db_dir=db_dir,
+                    abs_path=abs_path,
+                    source_rel=entry["file_path"],
+                    content_hash=entry["content_hash"],
+                    slot=slot,
+                    description=desc,
+                    chunk_kind="sheet_description",
+                    sheet_name=sheet_name,
+                ))
+
+            if aborted:
+                failed_paths.add(entry["file_path"])
+                continue
+
+            # File-level rollup
+            file_slot = full_needs.index("file")
+            file_desc = await _sample_with_retry(
+                ctx, build_file_prompt(preview, sheet_descriptions)
+            )
+            if file_desc is None:
+                failed_paths.add(entry["file_path"])
+                continue
+            chunks.append(_build_description_chunk(
+                db_dir=db_dir,
+                abs_path=abs_path,
+                source_rel=entry["file_path"],
+                content_hash=entry["content_hash"],
+                slot=file_slot,
+                description=file_desc,
+                chunk_kind="file_description",
+                sheet_name=None,
+            ))
+
+            # Atomic commit
+            chunks = embed_chunks(chunks)
+            store.add_chunks(chunks)
+            store.remove_pending(entry["file_path"])
+            written += len(chunks)
+
+    return written
 
 
 @mcp.tool(

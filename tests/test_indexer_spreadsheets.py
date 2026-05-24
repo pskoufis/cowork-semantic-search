@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import openpyxl
+import pytest
 
 from server.indexer import index_folder, compute_file_hash
 from server.paths import to_relative
@@ -132,3 +133,134 @@ def test_index_folder_evicts_legacy_csv_chunks_then_enqueues(tmp_path):
     assert fresh.count_chunks() == 0
     assert result["descriptions_queued"] == 1
     assert fresh.pending_count() == 1
+
+
+# --- auto-drainer (FastMCP sampling) ---
+
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import numpy as np
+
+
+def _fake_embed(texts):
+    out = []
+    for t in texts:
+        rng = np.random.RandomState(hash(t) % 2**32)
+        v = rng.randn(256).astype("float32")
+        out.append(v / np.linalg.norm(v))
+    return np.array(out)
+
+
+@pytest.fixture
+def mock_embed_model():
+    model = type("M", (), {
+        "encode": lambda self, texts, **kw: _fake_embed(texts)
+    })()
+    with patch("server.indexer.get_model", return_value=model):
+        yield model
+
+
+def test_auto_drainer_writes_chunks_via_mock_sampling(mock_embed_model, tmp_path):
+    """When ctx.sample is available, the auto-drainer turns queued entries
+    into description chunks and clears the queue."""
+    from server.main import _run_index_job
+    from server.jobs import registry
+
+    registry._jobs.clear(); registry._order.clear()
+    registry._persist_path = None
+
+    folder = tmp_path / "data"
+    folder.mkdir()
+    _write_xlsx(folder, "biz.xlsx", {
+        "Sales": [["region", "qty"], ["EMEA", 10]],
+        "Costs": [["category", "amount"], ["rent", 5000]],
+    })
+    db = str((tmp_path / "db").resolve())
+
+    canned_texts = [
+        "Sales by region.",
+        "Cost breakdown by category.",
+        "Workbook tracking sales vs costs.",
+    ]
+    canned_iter = iter(canned_texts)
+
+    async def fake_sample(*args, **kwargs):
+        return MagicMock(text=next(canned_iter))
+
+    ctx = MagicMock()
+    ctx.sample = fake_sample
+
+    job = registry.create(str(folder), db)
+    asyncio.run(_run_index_job(job, None, True, None, ctx=ctx))
+
+    fresh = VectorStore(db)
+    assert fresh.count_chunks() == 3
+    assert fresh.pending_count() == 0
+    final = job.to_dict()
+    assert final["result"]["descriptions_sampled"] == 3
+
+
+def test_auto_drainer_leaves_entry_when_sampling_fails(
+    mock_embed_model, tmp_path, monkeypatch,
+):
+    """A failure inside a file aborts that file atomically: no chunks land
+    and the queue entry stays for manual drain later."""
+    # Disable the 2s sampling-retry backoff so the test is fast.
+    monkeypatch.setattr("server.main._SAMPLE_RETRY_BACKOFF_SECONDS", 0)
+    from server.main import _run_index_job
+    from server.jobs import registry
+
+    registry._jobs.clear(); registry._order.clear()
+    registry._persist_path = None
+
+    folder = tmp_path / "data"
+    folder.mkdir()
+    _write_xlsx(folder, "biz.xlsx", {
+        "Sales": [["a"], [1]],
+        "Costs": [["b"], [2]],
+    })
+    db = str((tmp_path / "db").resolve())
+
+    call_n = {"i": 0}
+    async def flaky_sample(*args, **kwargs):
+        call_n["i"] += 1
+        if call_n["i"] == 1:
+            return MagicMock(text="Sales by region.")
+        raise RuntimeError("sampling boom")
+
+    ctx = MagicMock()
+    ctx.sample = flaky_sample
+
+    job = registry.create(str(folder), db)
+    asyncio.run(_run_index_job(job, None, True, None, ctx=ctx))
+
+    fresh = VectorStore(db)
+    # Atomic per-file commit: nothing written, entry still queued
+    assert fresh.count_chunks() == 0
+    assert fresh.pending_count() == 1
+    final = job.to_dict()
+    assert final["result"]["descriptions_sampled"] == 0
+
+
+def test_auto_drainer_skipped_when_ctx_is_none(mock_embed_model, tmp_path):
+    """Without a ctx, drain is skipped — entry stays queued for the LLM."""
+    from server.main import _run_index_job
+    from server.jobs import registry
+
+    registry._jobs.clear(); registry._order.clear()
+    registry._persist_path = None
+
+    folder = tmp_path / "data"
+    folder.mkdir()
+    _write_csv(folder, "x.csv")
+    db = str((tmp_path / "db").resolve())
+
+    job = registry.create(str(folder), db)
+    asyncio.run(_run_index_job(job, None, True, None, ctx=None))
+
+    fresh = VectorStore(db)
+    assert fresh.pending_count() == 1
+    final = job.to_dict()
+    assert final["result"]["descriptions_sampled"] == 0

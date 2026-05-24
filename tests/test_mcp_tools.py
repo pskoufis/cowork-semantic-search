@@ -357,7 +357,9 @@ async def test_mcp_get_index_status_on_pre_tier2_index(tmp_path):
 
     db_path = str(tmp_path / "db")
     old_schema = pa.schema(
-        [f for f in SCHEMA if f.name not in ("mtime_ns", "file_size")]
+        [f for f in SCHEMA if f.name not in (
+            "mtime_ns", "file_size", "chunk_kind", "sheet_name",
+        )]
     )
     row = {
         "id": "x_0", "text": "hello", "source_file": "corpus/x.txt",
