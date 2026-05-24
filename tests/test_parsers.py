@@ -1,4 +1,3 @@
-import csv
 from pathlib import Path
 
 import pytest
@@ -136,28 +135,25 @@ def test_parse_pptx_empty_slide(tmp_path):
     assert any("Has content" in r["text"] for r in result)
 
 
-# --- CSV tests ---
+# --- Spreadsheet routing ---
+#
+# CSV and XLSX no longer flow through extract_text — server/indexer.py routes
+# them to the description-queue path via server.spreadsheets.extract_preview.
+# extract_text rejects spreadsheet extensions so a stray caller can't fall
+# into the old raw-row scheme.
 
-def test_parse_csv(tmp_path):
-    csv_file = tmp_path / "data.csv"
-    with open(csv_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["name", "revenue", "quarter"])
-        writer.writerow(["Acme", "4200000", "Q3"])
-        writer.writerow(["Beta", "3100000", "Q4"])
-    result = extract_text(csv_file)
-    assert len(result) == 1
-    text = result[0]["text"]
-    assert "Acme" in text
-    assert "Q3" in text
-    assert "Beta" in text
+def test_extract_text_rejects_spreadsheet_extensions(tmp_path):
+    """CSV/XLSX raise ValueError from extract_text — they belong on the
+    spreadsheet preview path (see server.spreadsheets)."""
+    assert ".csv" in SUPPORTED_EXTENSIONS
+    assert ".xlsx" in SUPPORTED_EXTENSIONS
 
+    csv_file = tmp_path / "x.csv"
+    csv_file.write_text("a,b\n1,2\n")
+    with pytest.raises(ValueError):
+        extract_text(csv_file)
 
-def test_parse_csv_with_header_metadata(tmp_path):
-    csv_file = tmp_path / "small.csv"
-    with open(csv_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["col_a", "col_b"])
-        writer.writerow(["val1", "val2"])
-    result = extract_text(csv_file)
-    assert "col_a" in result[0]["text"]
+    xlsx_file = tmp_path / "x.xlsx"
+    xlsx_file.write_text("not a real xlsx")
+    with pytest.raises(ValueError):
+        extract_text(xlsx_file)
