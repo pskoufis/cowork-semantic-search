@@ -525,3 +525,59 @@ async def test_mcp_get_index_status_omits_exclusions_without_folder_path(tmp_pat
         data = json.loads(result.content[0].text)
 
     assert "exclusions" not in data
+
+
+# --- spreadsheet description tools ----------------------------------------
+
+
+@pytest.mark.anyio
+async def test_list_pending_descriptions_returns_enqueued(tmp_path):
+    from server.store import VectorStore
+    from server.paths import to_relative
+
+    db = str((tmp_path / "db").resolve())
+    # File must exist on disk or list_pending_descriptions auto-evicts it.
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    xlsx = folder / "a.xlsx"
+    xlsx.write_bytes(b"placeholder")  # contents don't matter for list_*
+    rel = to_relative(str(xlsx), db)
+
+    store = VectorStore(db)
+    store.enqueue_pending(
+        rel,
+        ["sheet:Sales", "file"],
+        json.dumps({"type": "xlsx", "sheets": [{"name": "Sales"}]}),
+        "h1",
+    )
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "list_pending_descriptions", {"db_path": db}
+        )
+    data = json.loads(result.content[0].text)
+    assert data["total_remaining"] == 1
+    assert len(data["pending"]) == 1
+    entry = data["pending"][0]
+    assert entry["file_path"] == rel
+    assert entry["needs"] == ["sheet:Sales", "file"]
+    assert entry["preview"]["type"] == "xlsx"
+
+
+@pytest.mark.anyio
+async def test_list_pending_descriptions_auto_evicts_deleted_files(tmp_path):
+    from server.store import VectorStore
+
+    db = str((tmp_path / "db").resolve())
+    fake_rel = "missing/x.csv"  # file does not exist on disk
+    store = VectorStore(db)
+    store.enqueue_pending(fake_rel, ["file"], json.dumps({"type": "csv"}), "h")
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "list_pending_descriptions", {"db_path": db}
+        )
+    data = json.loads(result.content[0].text)
+    assert data["pending"] == []
+    # Auto-evicted from the table on the read path
+    fresh = VectorStore(db)
+    assert fresh.pending_count() == 0
+

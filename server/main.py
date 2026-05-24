@@ -434,6 +434,76 @@ def reindex_file(
     }
 
 
+@mcp.tool(annotations={"readOnlyHint": True})
+def list_pending_descriptions(
+    folder_path: Annotated[
+        str | None,
+        Field(
+            description="Filter to entries whose file_path begins with this "
+                        "folder (matched as a path-prefix). If omitted, "
+                        "returns entries across all folders.",
+            default=None,
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(description="Max entries to return per call", default=20, ge=1, le=100),
+    ] = 20,
+    db_path: Annotated[
+        str | None,
+        Field(
+            description="Path to the LanceDB database. Uses LANCEDB_PATH env var if omitted.",
+            default=None,
+        ),
+    ] = None,
+) -> dict:
+    """List spreadsheets awaiting LLM-generated descriptions.
+
+    Each entry returns the preview (sheet names, headers, dtypes, sample
+    rows) the host LLM needs to write a description, plus the list of items
+    still needed: per-sheet descriptions like "sheet:Sales" and/or "file"
+    for the file-level rollup.
+
+    Submit a description back via `submit_description`. To skip a file
+    permanently (until its content changes), call
+    `dismiss_pending_description`.
+
+    Files that have been deleted from disk since they were enqueued are
+    auto-evicted from the queue and not surfaced.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from server.store import VectorStore
+    from server.paths import to_absolute
+
+    if db_path is None:
+        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+    db_dir = os.path.abspath(db_path)
+
+    store = VectorStore(db_dir)
+    # Pull extra so deleted-file evictions don't leave us short of `limit`.
+    raw = store.list_pending(folder_path=folder_path, limit=limit * 2)
+
+    pending: list[dict] = []
+    for entry in raw:
+        abs_path = _Path(to_absolute(entry["file_path"], db_dir))
+        if not abs_path.exists():
+            store.remove_pending(entry["file_path"])
+            continue
+        pending.append({
+            "file_path": entry["file_path"],
+            "needs": entry["needs"],
+            "preview": _json.loads(entry["preview_json"]),
+        })
+        if len(pending) >= limit:
+            break
+
+    return {
+        "pending": pending,
+        "total_remaining": store.pending_count(),
+    }
+
+
 def run():
     mcp.run()
 
