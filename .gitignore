@@ -15,3 +15,9 @@ test-docs/
 
 # Local MCP config with machine-specific paths — copy from .mcp.json.example
 .mcp.json
+
+.env
+
+# sample files
+mbox_handling/samples/
+mbox_handling/output/
