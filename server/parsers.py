@@ -1,10 +1,10 @@
 """Per-format text extraction from document files.
 
-CSV and XLSX are listed in SUPPORTED_EXTENSIONS so discover_files surfaces
-them, but they are deliberately routed by server/indexer.py to the
-description-queue path (server.spreadsheets) instead of through
-extract_text. extract_text raises for them so a stray caller can't fall
-back into the old raw-row scheme.
+Spreadsheet formats (.csv, .xlsx, .xlsm, .xls) are listed in
+SUPPORTED_EXTENSIONS so discover_files surfaces them, but they are
+deliberately routed by server/indexer.py to the description-queue path
+(server.spreadsheets) instead of through extract_text. extract_text raises
+for them so a stray caller can't fall back into the old raw-row scheme.
 """
 
 import re
@@ -12,7 +12,11 @@ import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 
-SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx", ".pptx", ".csv", ".xlsx", ".pst"}
+SUPPORTED_EXTENSIONS = {
+    ".txt", ".md", ".pdf", ".docx", ".pptx",
+    ".csv", ".xlsx", ".xlsm", ".xls",
+    ".pst",
+}
 
 
 def extract_text(file_path: Path) -> list[dict]:
@@ -40,7 +44,8 @@ def extract_text(file_path: Path) -> list[dict]:
             raise ValueError(
                 f"Unsupported file type: {suffix}. "
                 f"Supported via extract_text: .txt, .md, .pdf, .docx, .pptx, "
-                f".pst. CSV/XLSX route through server.spreadsheets."
+                f".pst. Spreadsheets (.csv/.xlsx/.xlsm/.xls) route through "
+                f"server.spreadsheets."
             )
 
 

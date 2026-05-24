@@ -65,6 +65,64 @@ def test_index_folder_enqueues_xlsx_per_sheet(tmp_path):
     assert pending["needs"] == ["sheet:Sales", "sheet:Costs", "file"]
 
 
+def _write_xlsm(folder: Path, name: str, sheets: dict[str, list[list]]) -> Path:
+    """An .xlsm is the same OOXML container as .xlsx — write then rename so
+    openpyxl's writer doesn't object to a fresh workbook lacking VBA."""
+    tmp = _write_xlsx(folder, "_tmp.xlsx", sheets)
+    target = folder / name
+    tmp.rename(target)
+    return target
+
+
+def _write_xls(folder: Path, name: str, sheets: dict[str, list[list]]) -> Path:
+    import xlwt
+    wb = xlwt.Workbook()
+    for sheet_name, rows in sheets.items():
+        ws = wb.add_sheet(sheet_name)
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                ws.write(r, c, val)
+    p = folder / name
+    wb.save(str(p))
+    return p
+
+
+def test_index_folder_enqueues_xlsm_per_sheet(tmp_path):
+    folder = tmp_path / "data"
+    folder.mkdir()
+    _write_xlsm(folder, "macros.xlsm", {
+        "Sales": [["a", "b"], [1, 2]],
+        "Costs": [["c", "d"], [3, 4]],
+    })
+    db = str((tmp_path / "db").resolve())
+
+    result = index_folder(str(folder), db_path=db)
+
+    assert result["descriptions_queued"] == 1
+    store = VectorStore(db)
+    [pending] = store.list_pending()
+    assert pending["needs"] == ["sheet:Sales", "sheet:Costs", "file"]
+    assert json.loads(pending["preview_json"])["type"] == "xlsm"
+
+
+def test_index_folder_enqueues_xls_per_sheet(tmp_path):
+    folder = tmp_path / "data"
+    folder.mkdir()
+    _write_xls(folder, "legacy.xls", {
+        "Sales": [["a", "b"], [1, 2]],
+        "Costs": [["c", "d"], [3, 4]],
+    })
+    db = str((tmp_path / "db").resolve())
+
+    result = index_folder(str(folder), db_path=db)
+
+    assert result["descriptions_queued"] == 1
+    store = VectorStore(db)
+    [pending] = store.list_pending()
+    assert pending["needs"] == ["sheet:Sales", "sheet:Costs", "file"]
+    assert json.loads(pending["preview_json"])["type"] == "xls"
+
+
 def test_index_folder_skips_dismissed_with_matching_hash(tmp_path):
     folder = tmp_path / "data"
     folder.mkdir()
@@ -92,6 +150,38 @@ def test_index_folder_reenqueues_when_dismissed_hash_differs(tmp_path):
 
     result = index_folder(str(folder), db_path=db)
     assert result["descriptions_queued"] == 1
+
+
+def test_exceeds_size_cap_exempts_spreadsheets(monkeypatch):
+    """Spreadsheet parsers stream their preview, so the global 100 MB cap
+    must not skip them regardless of file size."""
+    monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 100)
+    from server.indexer import exceeds_size_cap
+    for suffix in (".csv", ".xlsx", ".xlsm", ".xls"):
+        assert exceeds_size_cap(Path(f"x{suffix}"), 1_000_000_000) is False, suffix
+
+
+def test_exceeds_size_cap_still_applies_to_non_streaming(monkeypatch):
+    """Sanity: PDFs (which load the whole file) still respect the cap."""
+    monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 100)
+    from server.indexer import exceeds_size_cap
+    assert exceeds_size_cap(Path("x.pdf"), 200) is True
+
+
+def test_index_folder_streams_large_csv_above_size_cap(tmp_path, monkeypatch):
+    """A CSV bigger than the cap is enqueued via streaming, not size_skipped."""
+    monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 100)
+    folder = tmp_path / "data"
+    folder.mkdir()
+    rows = "id,val\n" + "\n".join(f"{i},x{i}" for i in range(200))
+    (folder / "big.csv").write_text(rows, encoding="utf-8")
+    db = str((tmp_path / "db").resolve())
+
+    result = index_folder(str(folder), db_path=db)
+
+    assert result["descriptions_queued"] == 1
+    assert result["files_size_skipped"] == 0
+    assert result["oversized_files"] == []
 
 
 def test_index_folder_evicts_legacy_csv_chunks_then_enqueues(tmp_path):
