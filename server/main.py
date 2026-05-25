@@ -76,7 +76,7 @@ async def index_folder(
         Field(
             description="File extensions to index, e.g. ['.pdf', '.md']. "
                         "Defaults to all supported types: .txt, .md, .pdf, "
-                        ".docx, .pptx, .pst. Spreadsheets "
+                        ".docx, .pptx, .pst, .mbox. Spreadsheets "
                         "(.csv/.xlsx/.xlsm/.xls) are temporarily disabled "
                         "and are silently filtered out even if passed here.",
             default=None,
@@ -109,7 +109,7 @@ async def index_folder(
     """Start a background job to index or re-index all documents in a folder.
 
     Scans the folder for supported document types (.txt, .md, .pdf, .docx,
-    .pptx, .pst), extracts text, splits into chunks, computes embeddings,
+    .pptx, .pst, .mbox), extracts text, splits into chunks, computes embeddings,
     stores them in a local vector database, and builds an ANN index for fast
     search. Only files that have changed since the last run are re-processed.
 

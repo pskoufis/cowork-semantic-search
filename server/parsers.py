@@ -19,6 +19,7 @@ SUPPORTED_EXTENSIONS = {
     # Spreadsheets temporarily disabled — restore .csv, .xlsx, .xlsm, .xls
     # here when the description-based path is ready for prime time.
     ".pst",
+    ".mbox",
 }
 
 
@@ -43,11 +44,13 @@ def extract_text(file_path: Path) -> list[dict]:
             return _extract_pptx(file_path)
         case ".pst":
             return _extract_pst(file_path)
+        case ".mbox":
+            return _extract_mbox(file_path)
         case _:
             raise ValueError(
                 f"Unsupported file type: {suffix}. "
                 f"Supported via extract_text: .txt, .md, .pdf, .docx, .pptx, "
-                f".pst. Spreadsheets (.csv/.xlsx/.xlsm/.xls) route through "
+                f".pst, .mbox. Spreadsheets (.csv/.xlsx/.xlsm/.xls) route through "
                 f"server.spreadsheets."
             )
 
@@ -360,3 +363,48 @@ def _strip_rtf(rtf_text: str) -> str:
     text = re.sub(r"\\[a-zA-Z]+-?\d*\s?", "", text)
     text = text.replace("{", "").replace("}", "")
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+# --- mbox (Unix mailbox) extraction ----------------------------------------
+#
+# Mirrors _extract_pst: one source_file per mbox, one part per message, with
+# a Subject/From/Date/Thread header folded into the text so each message
+# stays attributable. Threading metadata (thread_id/in_reply_to/references)
+# rides on the part so the search layer can re-group by conversation at
+# query time without re-indexing.
+
+
+def _extract_mbox(file_path: Path) -> list[dict]:
+    """Extract one part per mail message from an mbox archive."""
+    from mbox_handling.messages import iter_messages
+    from mbox_handling.threading import compute_thread_assignments
+
+    messages = list(iter_messages(file_path))
+    assignments = compute_thread_assignments(messages)
+
+    parts: list[dict] = []
+    for msg in messages:
+        thread_id = "unthreaded"
+        if msg.message_id and msg.message_id in assignments:
+            thread_id = assignments[msg.message_id].thread_id
+        elif not msg.message_id and f"no-id-{msg.index}" in assignments:
+            thread_id = assignments[f"no-id-{msg.index}"].thread_id
+
+        header = (
+            f"Subject: {msg.subject or '(no subject)'}\n"
+            f"From: {msg.from_addr or ''}\n"
+            f"Date: {msg.date or ''}\n"
+            f"Thread: {thread_id}"
+        )
+        segments = [header]
+        if msg.body and msg.body.strip():
+            segments.append(msg.body)
+        parts.append({
+            "text": "\n\n".join(segments),
+            "metadata": {
+                "thread_id": thread_id,
+                "in_reply_to": msg.in_reply_to or "",
+                "references": ",".join(msg.references) if msg.references else "",
+            },
+        })
+    return parts
