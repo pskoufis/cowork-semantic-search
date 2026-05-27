@@ -16,12 +16,13 @@ SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".pdf", ".docx", ".pptx",
     # Spreadsheets (.csv/.xlsx/.xlsm/.xls) temporarily disabled.
     ".pst",
-    # .mbox is NOT here: the indexer preprocesses every .mbox into a
-    # sibling <stem>_unpacked/ tree of per-message .txt files (plus
-    # materialized attachments under attachments/msg-NNNN/), and the
-    # normal walk picks those up via their native extensions. See
-    # mbox_handling.unpack.ensure_unpacked() and the preprocessing pass
-    # in server.indexer.index_folder.
+    # .mbox and .msg are NOT here: the indexer preprocesses every .mbox
+    # into a sibling <stem>_unpacked/ tree of per-message .txt files
+    # (plus materialized attachments under attachments/msg-NNNN/), and
+    # every .msg into a sibling <stem>.txt + attachments/<stem>__* layout.
+    # The normal walk picks those up via their native extensions. See
+    # mbox_handling.unpack.ensure_unpacked(), msg_handling.unpack.ensure_unpacked(),
+    # and the preprocessing pass in server.indexer.index_folder.
 }
 
 

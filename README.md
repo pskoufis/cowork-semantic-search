@@ -35,7 +35,7 @@ Your documents --> chunked --> embedded --> local vector DB
 - **Incremental indexing** -- SHA-256 content hashing. Only changed files get reprocessed. Re-indexing 1000 files where 3 changed takes seconds.
 - **Multilingual** -- handles 50+ languages natively. Search in one language, find results in another.
 - **Hybrid search** -- combines semantic similarity with full-text keyword search via Reciprocal Rank Fusion. Catches what pure vector search misses.
-- **Multiple formats** -- txt, md, pdf, docx, pptx, pst out of the box. (Spreadsheet support — csv, xlsx, xlsm, xls — is wired but temporarily disabled.)
+- **Multiple formats** -- txt, md, pdf, docx, pptx, pst, mbox, msg out of the box. (Spreadsheet support — csv, xlsx, xlsm, xls — is wired but temporarily disabled.)
 - **Any MCP client** -- works with Claude Code, Cursor, Windsurf, Cline, and any other MCP-compatible tool.
 - **Zero infrastructure** -- LanceDB stores everything as local files. No server, no Docker, no database to manage.
 
@@ -50,8 +50,11 @@ Your documents --> chunked --> embedded --> local vector DB
 | PowerPoint | `.pptx` | Slide-level extraction with metadata |
 | Outlook archive | `.pst` | One part per mail message, with attachment text |
 | Unix mailbox | `.mbox` | Indexer auto-unpacks each `.mbox` into a sibling `<stem>_unpacked/` tree of per-thread directories with one `.txt` per message + materialized attachments; the unpacked files (and attachments via their native parsers) are what gets indexed |
+| Outlook message | `.msg` | Indexer auto-unpacks each `.msg` into a sibling `<stem>.txt` (headers + body) and places attachments in a shared sibling `attachments/<stem>__<name>` layout; the unpacked files (and attachments via their native parsers) are what gets indexed |
 
 > **Mbox detail:** when the indexer encounters `archive.mbox`, it first writes (or refreshes, on mtime change) `archive_unpacked/` next to it — one folder per thread (`thread-NNNN_<subject-slug>/`), one `msg-NNNN.txt` per message, attachments under `attachments/msg-NNNN/`, orphan messages under `_unthreaded/`. The `.mbox` itself is not indexed; the resulting `.txt` files and attachments are picked up by the normal walk via their native extensions. To unpack an mbox manually outside an indexing run, use `python -m mbox_handling.unpack <mbox>` (writes to `<stem>_unpacked/` by default, or pass `--output-dir <dir>` to choose a path).
+
+> **Msg detail:** when the indexer encounters `foo.msg`, it writes (or refreshes, on mtime change) a sibling `foo.txt` containing the headers + plain-text body, and extracts each attachment to `attachments/foo__<original-name>` next to the `.msg`. Multiple `.msg` files in the same directory share one `attachments/` folder; the `<stem>__` prefix prevents collisions. Nested `.msg` attachments (forwarded emails) are recursively unpacked. The `.msg` itself is not indexed; the resulting `.txt` and attachments are picked up by the normal walk. Requires the `msg` extra: `pip install 'cowork-semantic-search[msg]'`. To unpack a single `.msg` manually outside an indexing run, use `python -m msg_handling.unpack <msg-path>`.
 
 > **Spreadsheets (csv, xlsx, xlsm, xls) are temporarily disabled.** The description-based path (preview → LLM-written description → embedded chunk) is implemented in `server/spreadsheets.py` and the MCP queue tools (`list_pending_descriptions` / `submit_description` / `dismiss_pending_description`) are still available, but `index_folder` does not currently discover these files. Description chunks already in the index from prior runs are preserved. Re-enable by restoring `.csv`/`.xlsx`/`.xlsm`/`.xls` to `SUPPORTED_EXTENSIONS` in `server/parsers.py` and removing the subtraction in `server/indexer.py:discover_files`.
 
@@ -335,6 +338,7 @@ server/
 | DOCX | python-docx | Lightweight, no system deps |
 | PPTX | python-pptx | Slide-level extraction |
 | PST | libpff (pypff) | Streams Outlook archives without reading them whole |
+| MSG | extract-msg | Outlook compound-document email format; pre-indexer unpacker spawns sibling .txt + attachments/ |
 
 ## Development
 
