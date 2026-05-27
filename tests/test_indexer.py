@@ -200,6 +200,62 @@ def test_index_survives_relocation(mock_get_model, tmp_path):
 
 
 @patch("server.indexer.get_model")
+def test_index_folder_unpacks_mbox_then_indexes_txt_files(
+    mock_get_model, tmp_path
+):
+    """index_folder() must (a) materialise <stem>_unpacked/ next to the
+    .mbox, (b) index the per-message .txt files, (c) NOT index the
+    .mbox file itself."""
+    from tests.test_mbox_messages import _make_entry, _make_mbox
+
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    mbox = _make_mbox(
+        corpus,
+        _make_entry(
+            {
+                "From": "alice@x",
+                "Subject": "Thread one",
+                "Message-ID": "<root@x>",
+                "Date": "Mon, 1 Jan 2024 00:00:00 +0000",
+            },
+            "root body",
+        ),
+        _make_entry(
+            {
+                "From": "bob@x",
+                "Subject": "Re: Thread one",
+                "Message-ID": "<reply@x>",
+                "In-Reply-To": "<root@x>",
+                "Date": "Mon, 1 Jan 2024 00:01:00 +0000",
+            },
+            "reply body",
+        ),
+        name="archive.mbox",
+    )
+
+    db_path = str(tmp_path / "testdb")
+    result = index_folder(str(corpus), db_path=db_path)
+
+    unpacked = corpus / "archive_unpacked"
+    assert unpacked.is_dir(), "preprocessing pass should have created _unpacked/"
+    txt_files = list(unpacked.rglob("msg-*.txt"))
+    assert len(txt_files) == 2, f"expected 2 message .txt files, got {len(txt_files)}"
+
+    indexed = VectorStore(db_path).get_all_files()
+    # The two .txt files are indexed.
+    assert sum(1 for f in indexed if f.endswith(".txt")) == 2
+    # The .mbox itself is NOT indexed.
+    assert not any(f.endswith(".mbox") for f in indexed), (
+        f"mbox should not be in the index, got: {indexed}"
+    )
+    assert result["status"] == "completed"
+
+
+@patch("server.indexer.get_model")
 def test_index_folder_handles_apostrophe_in_path(mock_get_model, tmp_path):
     """A file whose path contains a single quote is skip-detected on re-runs."""
     mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()

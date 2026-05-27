@@ -1,17 +1,22 @@
-"""Thread-grouped mbox unpacker CLI.
+"""Thread-grouped mbox unpacker.
 
-Writes one directory per thread under the output dir, with one .txt per
-message inside the thread directory and attachments co-located under
-``attachments/msg-NNNN/``. Orphan messages (no resolvable parent) go to
-``_unthreaded/``.
+Two callers:
 
-``--output-dir`` is optional. When omitted, the unpacker writes to
-``<mbox-stem>_unpacked/`` next to the mbox file. If that sibling already
-exists and is non-empty, ``-1``/``-2``/... suffixes are appended until an
-unused (or empty) directory is found, so a default run never clobbers an
-existing unpack tree. An explicit ``--output-dir`` keeps the original
-behaviour: if the target exists and is non-empty, its contents are wiped
-before writing.
+1. The indexer (``server/indexer.py``): calls :func:`ensure_unpacked` as
+   a preprocessing pass before its corpus walk, so a sibling
+   ``<stem>_unpacked/`` tree exists next to every ``.mbox``. The indexer
+   then sees the per-message ``.txt`` files (and materialized
+   attachments) and ignores the ``.mbox`` itself.
+
+2. The CLI (``python -m mbox_handling.unpack <mbox>``): manual
+   unpacking outside of an indexing run. ``--output-dir`` is optional.
+   When omitted, the unpacker writes to ``<mbox-stem>_unpacked/`` next
+   to the mbox file; if that sibling already exists and is non-empty,
+   ``-1``/``-2``/... suffixes are appended until an unused (or empty)
+   directory is found, so a manual run never clobbers an existing
+   unpack tree. An explicit ``--output-dir`` keeps the original
+   behaviour: if the target exists and is non-empty, its contents are
+   wiped before writing.
 
 Usage:
     python -m mbox_handling.unpack <mbox-path>
@@ -24,12 +29,52 @@ import argparse
 import re
 import shutil
 import sys
-from collections import defaultdict
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 from mbox_handling.messages import ParsedMessage, iter_messages
 from mbox_handling.threading import ThreadAssignment, compute_thread_assignments
+
+
+def ensure_unpacked(mbox_path: Path, target: Path | None = None) -> Path:
+    """Ensure an unpacked tree exists for ``mbox_path``; return its path.
+
+    Two modes:
+
+    - **Library mode** (``target=None``): writes to
+      ``<stem>_unpacked/`` next to the mbox. If that sibling already
+      exists and is non-empty, the tree is reused as-is when the mbox
+      is not newer than the directory (``st_mtime`` comparison), and
+      regenerated (full clobber) when the mbox is newer. Never picks a
+      ``-N`` suffix — the indexer always wants the plain sibling path.
+
+    - **Explicit mode** (``target=<path>``): writes to that path with
+      the original CLI semantics — clobber non-empty content before
+      writing, no mtime check.
+
+    Raises ``FileNotFoundError`` if ``mbox_path`` does not exist.
+    """
+    mbox_path = Path(mbox_path).expanduser().resolve()
+    if not mbox_path.is_file():
+        raise FileNotFoundError(f"mbox file not found: {mbox_path}")
+
+    if target is None:
+        out = mbox_path.parent / f"{mbox_path.stem}_unpacked"
+        if out.exists() and any(out.iterdir()):
+            if mbox_path.stat().st_mtime <= out.stat().st_mtime:
+                return out
+            # mbox is newer → fall through to full clobber + rewrite.
+    else:
+        out = Path(target).expanduser().resolve()
+
+    _prepare_output(out)
+    msg_count, thread_count = _write_unpacked_tree(mbox_path, out)
+    print(
+        f"Unpacked {msg_count} message(s) from {mbox_path.name} into "
+        f"{thread_count} thread(s) at {out}",
+        file=sys.stderr,
+    )
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,31 +86,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.output_dir is None:
-        out = _pick_default_output_dir(mbox_path)
-        print(f"notice: writing to default output dir {out}", file=sys.stderr)
+        target = _pick_default_output_dir(mbox_path)
+        print(f"notice: writing to default output dir {target}", file=sys.stderr)
     else:
-        out = Path(args.output_dir).expanduser().resolve()
+        target = Path(args.output_dir).expanduser().resolve()
 
-    _prepare_output(out)
-
-    messages = list(iter_messages(mbox_path))
-    assignments = compute_thread_assignments(messages)
-
-    groups = _group_messages(messages, assignments)
-    thread_count = 0
-    for thread_idx, group in enumerate(_iter_threads(groups), start=1):
-        thread_dir = _thread_dir(out, thread_idx, group)
-        thread_dir.mkdir(parents=True, exist_ok=True)
-        attachments_root = thread_dir / "attachments"
-        for msg_pos, msg in enumerate(group.messages, start=1):
-            _write_message(thread_dir, attachments_root, msg, msg_pos)
-        if not group.is_orphan_bucket:
-            thread_count += 1
-
-    print(
-        f"Unpacked {len(messages)} message(s) into {thread_count} thread(s)",
-        file=sys.stderr,
-    )
+    ensure_unpacked(mbox_path, target=target)
     return 0
 
 
@@ -91,6 +117,10 @@ def _pick_default_output_dir(mbox_path: Path) -> Path:
     """Choose <stem>_unpacked next to the mbox, falling back to
     <stem>_unpacked-1/-2/... when the candidate exists and is non-empty.
     An existing empty directory is reused (no suffix bump).
+
+    Only used by the CLI's default branch — the indexer's preprocessing
+    pass always uses the plain <stem>_unpacked path via
+    :func:`ensure_unpacked`.
     """
     parent = mbox_path.parent
     stem = mbox_path.stem
@@ -122,6 +152,27 @@ def _prepare_output(out: Path) -> None:
                     child.unlink()
     else:
         out.mkdir(parents=True, exist_ok=True)
+
+
+def _write_unpacked_tree(mbox_path: Path, out: Path) -> tuple[int, int]:
+    """Run the unpack pipeline into ``out``.
+
+    Returns ``(message_count, thread_count)`` for the summary line.
+    """
+    messages = list(iter_messages(mbox_path))
+    assignments = compute_thread_assignments(messages)
+
+    groups = _group_messages(messages, assignments)
+    thread_count = 0
+    for thread_idx, group in enumerate(_iter_threads(groups), start=1):
+        thread_dir = _thread_dir(out, thread_idx, group)
+        thread_dir.mkdir(parents=True, exist_ok=True)
+        attachments_root = thread_dir / "attachments"
+        for msg_pos, msg in enumerate(group.messages, start=1):
+            _write_message(thread_dir, attachments_root, msg, msg_pos)
+        if not group.is_orphan_bucket:
+            thread_count += 1
+    return len(messages), thread_count
 
 
 class _Group:

@@ -359,6 +359,144 @@ def test_unpack_exit_code_zero_for_empty_mbox(tmp_path: Path) -> None:
     assert out.is_dir()
 
 
+# --- ensure_unpacked() library API ----------------------------------------
+#
+# The indexer's preprocessing pass calls ensure_unpacked() rather than the
+# CLI's main(). It expects: default sibling path, mtime-based refresh, no
+# -N suffix bumping, idempotent reuse of fresh trees.
+
+
+def test_ensure_unpacked_creates_default_sibling(tmp_path: Path) -> None:
+    from mbox_handling.unpack import ensure_unpacked
+
+    mbox = _make_mbox(
+        tmp_path,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+    )
+    out = ensure_unpacked(mbox)
+    assert out == mbox.parent / f"{mbox.stem}_unpacked"
+    assert out.is_dir()
+    assert any(out.rglob("msg-*.txt"))
+
+
+def test_ensure_unpacked_reuses_fresh_dir(tmp_path: Path) -> None:
+    from mbox_handling.unpack import ensure_unpacked
+
+    mbox = _make_mbox(
+        tmp_path,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+    )
+    # First run materialises the tree.
+    out = ensure_unpacked(mbox)
+    txt_files = list(out.rglob("msg-*.txt"))
+    assert txt_files, "first run should have produced .txt files"
+    first_mtime = txt_files[0].stat().st_mtime_ns
+
+    # Force dir mtime to be strictly newer than mbox mtime so the
+    # "mbox is newer?" check returns False even on filesystems with
+    # coarse mtime resolution.
+    import os
+    mbox_mtime_ns = mbox.stat().st_mtime_ns
+    os.utime(out, ns=(mbox_mtime_ns + 1_000_000_000, mbox_mtime_ns + 1_000_000_000))
+
+    # Second run must reuse — no .txt file should be rewritten.
+    out2 = ensure_unpacked(mbox)
+    assert out2 == out
+    assert txt_files[0].stat().st_mtime_ns == first_mtime
+
+
+def test_ensure_unpacked_refreshes_when_mbox_newer(tmp_path: Path) -> None:
+    from mbox_handling.unpack import ensure_unpacked
+
+    mbox = _make_mbox(
+        tmp_path,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+    )
+    out = ensure_unpacked(mbox)
+    sentinel = out / "leftover.txt"
+    sentinel.write_text("from prior run")
+
+    # Bump mbox mtime well past dir mtime to trigger refresh.
+    import os
+    future_ns = out.stat().st_mtime_ns + 5_000_000_000  # +5s
+    os.utime(mbox, ns=(future_ns, future_ns))
+
+    out2 = ensure_unpacked(mbox)
+    assert out2 == out
+    # Refresh is a full clobber — sentinel must not survive.
+    assert not sentinel.exists()
+    assert any(out.rglob("msg-*.txt"))
+
+
+def test_ensure_unpacked_explicit_target_clobbers(tmp_path: Path) -> None:
+    from mbox_handling.unpack import ensure_unpacked
+
+    mbox = _make_mbox(
+        tmp_path,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+    )
+    target = tmp_path / "explicit-out"
+    target.mkdir()
+    (target / "junk.txt").write_text("clobber me")
+
+    out = ensure_unpacked(mbox, target=target)
+    assert out == target.resolve()
+    assert not (target / "junk.txt").exists()
+    assert any(target.rglob("msg-*.txt"))
+
+
+def test_ensure_unpacked_raises_when_mbox_missing(tmp_path: Path) -> None:
+    from mbox_handling.unpack import ensure_unpacked
+
+    with pytest.raises(FileNotFoundError):
+        ensure_unpacked(tmp_path / "no-such.mbox")
+
+
+def test_ensure_unpacked_does_not_bump_suffix_on_collision(
+    tmp_path: Path,
+) -> None:
+    """Library mode must NOT use the -1/-2/... suffix logic — that
+    belongs to the CLI's default branch. When a non-empty sibling
+    exists and the mbox is newer, library mode clobbers it in place.
+    """
+    from mbox_handling.unpack import ensure_unpacked
+
+    mbox = _make_mbox(
+        tmp_path,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+    )
+    base = mbox.parent / f"{mbox.stem}_unpacked"
+    base.mkdir()
+    (base / "prior.txt").write_text("prior")
+
+    # Make mbox newer so the refresh path triggers.
+    import os
+    future_ns = base.stat().st_mtime_ns + 5_000_000_000
+    os.utime(mbox, ns=(future_ns, future_ns))
+
+    out = ensure_unpacked(mbox)
+    assert out == base
+    # Suffix variant must NOT exist.
+    assert not (mbox.parent / f"{mbox.stem}_unpacked-1").exists()
+    # Original was clobbered.
+    assert not (base / "prior.txt").exists()
+
+
 def test_unpack_per_message_error_does_not_abort(
     monkeypatch, tmp_path: Path
 ) -> None:
