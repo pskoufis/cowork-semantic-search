@@ -3,10 +3,12 @@
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Callable
 
+from mbox_handling.unpack import ensure_unpacked
 from server.parsers import extract_text, SUPPORTED_EXTENSIONS
 from server.chunker import chunk_document
 from server.exclusions import ExclusionRules
@@ -195,6 +197,49 @@ def _finalize_index(
     return warnings
 
 
+def _ensure_mboxes_unpacked(
+    folder: Path,
+    *,
+    recursive: bool,
+    exclusions: ExclusionRules | None,
+) -> None:
+    """Walk ``folder`` for ``*.mbox`` files and ensure each has a fresh
+    sibling ``<stem>_unpacked/`` tree before the main indexer walk runs.
+
+    Mirrors ``discover_files`` exclusion + recursive semantics so an
+    mbox in an excluded directory is never unpacked. A per-mbox error
+    is logged and skipped — one broken mbox must not abort the run.
+    Cannot reuse ``discover_files`` because ``.mbox`` is no longer in
+    ``SUPPORTED_EXTENSIONS`` (the unpacked ``.txt`` files are what gets
+    indexed).
+    """
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dpath = Path(dirpath)
+        if recursive:
+            if exclusions is not None:
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not exclusions.is_excluded(dpath / d, folder, is_dir=True)
+                ]
+        else:
+            dirnames[:] = []
+        for name in filenames:
+            if not name.lower().endswith(".mbox"):
+                continue
+            mbox_path = dpath / name
+            if exclusions is not None and exclusions.is_excluded(
+                mbox_path, folder, is_dir=False
+            ):
+                continue
+            try:
+                ensure_unpacked(mbox_path)
+            except Exception as e:
+                print(
+                    f"warning: failed to unpack {mbox_path}: {e}",
+                    file=sys.stderr,
+                )
+
+
 def index_folder(
     folder_path: str,
     file_types: list[str] | None = None,
@@ -214,6 +259,11 @@ def index_folder(
     # Compile exclusion rules early — a bad pattern raises ValueError before
     # any work is done. The MCP layer turns that into a `rejected` response.
     exclusions = ExclusionRules.load(folder, extra_patterns=exclude, db_dir=db_dir)
+
+    # Preprocessing pass: every .mbox under the corpus gets a fresh
+    # sibling <stem>_unpacked/ tree. The main walk then sees the .txt
+    # files (and materialized attachments) instead of the .mbox itself.
+    _ensure_mboxes_unpacked(folder, recursive=recursive, exclusions=exclusions)
 
     store = VectorStore(db_dir)
     store.ensure_schema()  # migrate older indexes in place, if needed
