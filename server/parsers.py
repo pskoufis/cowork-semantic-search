@@ -1,12 +1,10 @@
 """Per-format text extraction from document files.
 
-Spreadsheet formats (.csv, .xlsx, .xlsm, .xls) are *temporarily disabled*
-from the indexing pipeline: the description-based path lives in
-server/spreadsheets.py and the MCP queue tools (list_pending_descriptions,
-submit_description, dismiss_pending_description) are still available, but
-discover_files no longer surfaces these files. To re-enable, restore them
-to SUPPORTED_EXTENSIONS below and remove the matching filter in
-server/indexer.py:discover_files.
+Spreadsheet formats (.csv, .xlsx, .xlsm, .xls) do not flow through
+extract_text — they route via server/spreadsheets.py to a description-based
+queue (preview → LLM description → embedded chunk). server.indexer routes
+them directly; extract_text rejects them so a stray caller cannot fall into
+a raw-row scheme.
 """
 
 import re
@@ -16,8 +14,7 @@ from pathlib import Path
 
 SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".pdf", ".docx", ".pptx",
-    # Spreadsheets temporarily disabled — restore .csv, .xlsx, .xlsm, .xls
-    # here when the description-based path is ready for prime time.
+    # Spreadsheets (.csv/.xlsx/.xlsm/.xls) temporarily disabled.
     ".pst",
     ".mbox",
 }
