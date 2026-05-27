@@ -28,27 +28,40 @@ from pathlib import Path
 from msg_handling.messages import ParsedMessage, read_message
 
 
-def ensure_unpacked(msg_path: Path) -> Path:
-    """Ensure ``<stem>.txt`` and ``attachments/<stem>__*`` are fresh next to
-    ``msg_path``. Return the directory containing the outputs.
+def ensure_unpacked(msg_path: Path, target: Path | None = None) -> Path:
+    """Ensure ``<stem>.txt`` and ``attachments/<stem>__*`` are fresh.
 
-    Idempotency: when ``<stem>.txt`` exists and is at least as new as the
-    ``.msg``, no work is done. A re-extract first parses the .msg, *then*
-    cleans prior outputs for this stem, *then* writes — so a parse failure
-    leaves the prior outputs in place.
+    By default (``target=None``), outputs land next to the source ``.msg``
+    — the in-place behavior the indexer's preprocessing pass and the
+    ``python -m msg_handling.unpack`` CLI both rely on.
 
-    A per-file error is logged to stderr and skipped — never raised.
+    When ``target=<dir>`` is provided, outputs land in that directory
+    instead: ``<target>/<stem>.txt`` + ``<target>/attachments/<stem>__*``.
+    The source ``.msg`` is left untouched. Used by the batch
+    ``unpack_msg_folder.py`` script to mirror a corpus's subdirectory
+    layout into a separate output tree.
+
+    Idempotency: when ``<out>/<stem>.txt`` exists and is at least as new
+    as the ``.msg``, no work is done. A re-extract first parses the
+    ``.msg``, *then* cleans prior outputs for this stem, *then* writes —
+    so a parse failure leaves the prior outputs in place.
+
+    Returns the directory containing the outputs (either ``msg_path.parent``
+    or the resolved ``target``).
     """
     msg_path = Path(msg_path).expanduser().resolve()
     if not msg_path.is_file():
         raise FileNotFoundError(f"msg file not found: {msg_path}")
 
     stem = msg_path.stem
-    parent = msg_path.parent
-    txt_path = parent / f"{stem}.txt"
+    out_dir = (
+        msg_path.parent if target is None
+        else Path(target).expanduser().resolve()
+    )
+    txt_path = out_dir / f"{stem}.txt"
 
     if _is_fresh(msg_path, txt_path):
-        return parent
+        return out_dir
 
     try:
         parsed = read_message(msg_path)
@@ -57,12 +70,13 @@ def ensure_unpacked(msg_path: Path) -> Path:
             f"warning: failed to read {msg_path.name}: {exc}",
             file=sys.stderr,
         )
-        return parent
+        return out_dir
 
-    _cleanup_prior_outputs(parent, stem)
-    _write_outputs(parent, stem, parsed)
-    _recurse_into_nested(parent, stem, parsed)
-    return parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_prior_outputs(out_dir, stem)
+    _write_outputs(out_dir, stem, parsed)
+    _recurse_into_nested(out_dir, stem, parsed)
+    return out_dir
 
 
 def _is_fresh(msg_path: Path, txt_path: Path) -> bool:

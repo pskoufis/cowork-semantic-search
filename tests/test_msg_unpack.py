@@ -321,6 +321,92 @@ def test_attachment_filename_path_traversal_is_neutralized(
     assert not (tmp_path / "escape.txt").exists()
 
 
+def test_ensure_unpacked_writes_to_target_when_provided(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With target=<dir>, outputs land in that directory instead of next to
+    the source .msg. The source folder is untouched."""
+    from msg_handling.unpack import ensure_unpacked
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    msg_path = src / "foo.msg"
+    _touch_msg(msg_path)
+    _install_reader(monkeypatch, lambda p: _msg(
+        subject="Hello",
+        body="hi there",
+        attachments=(_att("report.pdf", b"PDF"),),
+    ))
+
+    ensure_unpacked(msg_path, target=dst)
+
+    # Outputs land in dst, not src.
+    assert (dst / "foo.txt").is_file()
+    assert (dst / "attachments" / "foo__report.pdf").read_bytes() == b"PDF"
+    # Source is untouched aside from the .msg we created.
+    assert not (src / "foo.txt").exists()
+    assert not (src / "attachments").exists()
+
+
+def test_ensure_unpacked_target_is_idempotent_when_txt_fresher(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The mtime skip path checks the .txt inside `target`, not next to the
+    source .msg."""
+    from msg_handling.unpack import ensure_unpacked
+    from msg_handling import unpack
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    msg_path = src / "foo.msg"
+    _touch_msg(msg_path)
+    _install_reader(monkeypatch, lambda p: _msg(subject="A", body="b"))
+    ensure_unpacked(msg_path, target=dst)
+    target_txt = dst / "foo.txt"
+    assert target_txt.is_file()
+    _bump_mtime(target_txt)
+
+    def tripwire(_path):
+        raise AssertionError("read_message should not be called on idempotent skip")
+    monkeypatch.setattr(unpack, "read_message", tripwire)
+
+    ensure_unpacked(msg_path, target=dst)  # must not raise
+
+
+def test_ensure_unpacked_target_cleans_only_stem_scoped_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A re-extract via target= only removes target/<stem>.txt and
+    target/attachments/<stem>__* — pre-existing unrelated files in target
+    are preserved."""
+    from msg_handling.unpack import ensure_unpacked
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    msg_path = src / "foo.msg"
+    _touch_msg(msg_path)
+    foo_att_name = {"name": "old.pdf"}
+    _install_reader(monkeypatch, lambda p: _msg(
+        attachments=(_att(foo_att_name["name"], b"x"),),
+    ))
+    ensure_unpacked(msg_path, target=dst)
+
+    # Drop an unrelated bystander into target before re-extract.
+    bystander = dst / "attachments" / "bar__keep.pdf"
+    bystander.write_bytes(b"KEEP")
+    _bump_mtime(msg_path)
+    foo_att_name["name"] = "new.pdf"
+
+    ensure_unpacked(msg_path, target=dst)
+
+    assert (dst / "attachments" / "foo__new.pdf").is_file()
+    assert not (dst / "attachments" / "foo__old.pdf").exists()
+    assert bystander.read_bytes() == b"KEEP"
+
+
 def test_index_folder_preprocesses_msg(tmp_path: Path, monkeypatch) -> None:
     """End-to-end: index_folder() runs the .msg preprocessing pass, the
     spawned .txt is indexed, and the .msg itself is not."""
