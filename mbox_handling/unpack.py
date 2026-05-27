@@ -1,14 +1,20 @@
 """Thread-grouped mbox unpacker CLI.
 
-Writes one directory per thread under ``--output-dir``, with one .txt per
+Writes one directory per thread under the output dir, with one .txt per
 message inside the thread directory and attachments co-located under
 ``attachments/msg-NNNN/``. Orphan messages (no resolvable parent) go to
 ``_unthreaded/``.
 
-``--output-dir`` is required (no default) so the tree never accidentally
-lands inside an indexed folder.
+``--output-dir`` is optional. When omitted, the unpacker writes to
+``<mbox-stem>_unpacked/`` next to the mbox file. If that sibling already
+exists and is non-empty, ``-1``/``-2``/... suffixes are appended until an
+unused (or empty) directory is found, so a default run never clobbers an
+existing unpack tree. An explicit ``--output-dir`` keeps the original
+behaviour: if the target exists and is non-empty, its contents are wiped
+before writing.
 
 Usage:
+    python -m mbox_handling.unpack <mbox-path>
     python -m mbox_handling.unpack <mbox-path> --output-dir <dir>
 """
 
@@ -29,11 +35,16 @@ from mbox_handling.threading import ThreadAssignment, compute_thread_assignments
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     mbox_path = Path(args.mbox_path).expanduser().resolve()
-    out = Path(args.output_dir).expanduser().resolve()
 
     if not mbox_path.is_file():
         print(f"error: mbox file not found: {mbox_path}", file=sys.stderr)
         return 1
+
+    if args.output_dir is None:
+        out = _pick_default_output_dir(mbox_path)
+        print(f"notice: writing to default output dir {out}", file=sys.stderr)
+    else:
+        out = Path(args.output_dir).expanduser().resolve()
 
     _prepare_output(out)
 
@@ -65,10 +76,39 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("mbox_path", help="Path to the mbox file")
     parser.add_argument(
         "--output-dir",
-        required=True,
-        help="Directory to write thread/<msg>.txt + attachments/ into. Required.",
+        default=None,
+        help=(
+            "Directory to write thread/<msg>.txt + attachments/ into. "
+            "Defaults to <mbox-stem>_unpacked next to the mbox file "
+            "(with -1/-2/... suffixes if that sibling exists and is "
+            "non-empty)."
+        ),
     )
     return parser.parse_args(argv)
+
+
+def _pick_default_output_dir(mbox_path: Path) -> Path:
+    """Choose <stem>_unpacked next to the mbox, falling back to
+    <stem>_unpacked-1/-2/... when the candidate exists and is non-empty.
+    An existing empty directory is reused (no suffix bump).
+    """
+    parent = mbox_path.parent
+    stem = mbox_path.stem
+    base = parent / f"{stem}_unpacked"
+    if not _is_in_use(base):
+        return base
+    for n in range(1, 1000):
+        candidate = parent / f"{stem}_unpacked-{n}"
+        if not _is_in_use(candidate):
+            return candidate
+    raise RuntimeError(
+        f"could not find an unused default output dir next to {mbox_path}; "
+        "pass --output-dir explicitly."
+    )
+
+
+def _is_in_use(path: Path) -> bool:
+    return path.exists() and any(path.iterdir())
 
 
 def _prepare_output(out: Path) -> None:

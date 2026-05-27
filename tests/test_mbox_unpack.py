@@ -18,12 +18,93 @@ def _list_files(root: Path) -> list[str]:
     return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
 
 
-def test_unpack_requires_output_dir_argument() -> None:
+def test_unpack_defaults_output_dir_to_sibling_of_mbox(tmp_path: Path) -> None:
     from mbox_handling.unpack import main
 
-    with pytest.raises(SystemExit) as exc_info:
-        main(["some.mbox"])
-    assert exc_info.value.code == 2
+    mbox = _make_mbox(
+        tmp_path,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+    )
+    expected = mbox.parent / f"{mbox.stem}_unpacked"
+
+    rc = main([str(mbox)])
+    assert rc == 0
+    assert expected.is_dir()
+    assert any(expected.rglob("msg-*.txt"))
+
+
+def test_unpack_default_dir_suffix_on_non_empty_collision(tmp_path: Path) -> None:
+    from mbox_handling.unpack import main
+
+    mbox = _make_mbox(
+        tmp_path,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+    )
+    base = mbox.parent / f"{mbox.stem}_unpacked"
+    base.mkdir()
+    (base / "prior.txt").write_text("keep me")
+
+    rc = main([str(mbox)])
+    assert rc == 0
+    # Original target untouched, suffix variant created.
+    assert (base / "prior.txt").read_text() == "keep me"
+    suffixed = mbox.parent / f"{mbox.stem}_unpacked-1"
+    assert suffixed.is_dir()
+    assert any(suffixed.rglob("msg-*.txt"))
+
+
+def test_unpack_default_dir_advances_to_next_suffix(tmp_path: Path) -> None:
+    from mbox_handling.unpack import main
+
+    mbox = _make_mbox(
+        tmp_path,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+    )
+    base = mbox.parent / f"{mbox.stem}_unpacked"
+    base.mkdir()
+    (base / "a.txt").write_text("x")
+    first = mbox.parent / f"{mbox.stem}_unpacked-1"
+    first.mkdir()
+    (first / "b.txt").write_text("y")
+
+    rc = main([str(mbox)])
+    assert rc == 0
+    second = mbox.parent / f"{mbox.stem}_unpacked-2"
+    assert second.is_dir()
+    assert any(second.rglob("msg-*.txt"))
+    # Earlier collisions left alone.
+    assert (base / "a.txt").exists()
+    assert (first / "b.txt").exists()
+
+
+def test_unpack_default_dir_reuses_existing_empty_sibling(tmp_path: Path) -> None:
+    from mbox_handling.unpack import main
+
+    mbox = _make_mbox(
+        tmp_path,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+    )
+    base = mbox.parent / f"{mbox.stem}_unpacked"
+    base.mkdir()
+
+    rc = main([str(mbox)])
+    assert rc == 0
+    assert base.is_dir()
+    assert any(base.rglob("msg-*.txt"))
+    # No suffix variant created when the original was empty.
+    assert not (mbox.parent / f"{mbox.stem}_unpacked-1").exists()
 
 
 def test_unpack_creates_thread_directory_per_thread(tmp_path: Path) -> None:
