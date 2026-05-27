@@ -49,9 +49,9 @@ Your documents --> chunked --> embedded --> local vector DB
 | Word | `.docx` | Full paragraph extraction |
 | PowerPoint | `.pptx` | Slide-level extraction with metadata |
 | Outlook archive | `.pst` | One part per mail message, with attachment text |
-| Unix mailbox | `.mbox` | One part per mail message, with thread metadata for re-grouping at search time |
+| Unix mailbox | `.mbox` | Indexer auto-unpacks each `.mbox` into a sibling `<stem>_unpacked/` tree of per-thread directories with one `.txt` per message + materialized attachments; the unpacked files (and attachments via their native parsers) are what gets indexed |
 
-> **Tip:** to also produce a thread-grouped directory tree of plain `.txt` files (e.g. for a separate tool that consumes plain directories), run `python -m mbox_handling.unpack <mbox> --output-dir <dir>`. The unpacker writes one folder per thread, one `.txt` per message, and co-locates attachments. Orphans (no resolvable parent) collect under `_unthreaded/`.
+> **Mbox detail:** when the indexer encounters `archive.mbox`, it first writes (or refreshes, on mtime change) `archive_unpacked/` next to it — one folder per thread (`thread-NNNN_<subject-slug>/`), one `msg-NNNN.txt` per message, attachments under `attachments/msg-NNNN/`, orphan messages under `_unthreaded/`. The `.mbox` itself is not indexed; the resulting `.txt` files and attachments are picked up by the normal walk via their native extensions. To unpack an mbox manually outside an indexing run, use `python -m mbox_handling.unpack <mbox>` (writes to `<stem>_unpacked/` by default, or pass `--output-dir <dir>` to choose a path).
 
 > **Spreadsheets (csv, xlsx, xlsm, xls) are temporarily disabled.** The description-based path (preview → LLM-written description → embedded chunk) is implemented in `server/spreadsheets.py` and the MCP queue tools (`list_pending_descriptions` / `submit_description` / `dismiss_pending_description`) are still available, but `index_folder` does not currently discover these files. Description chunks already in the index from prior runs are preserved. Re-enable by restoring `.csv`/`.xlsx`/`.xlsm`/`.xls` to `SUPPORTED_EXTENSIONS` in `server/parsers.py` and removing the subtraction in `server/indexer.py:discover_files`.
 

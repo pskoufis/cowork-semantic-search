@@ -76,9 +76,12 @@ async def index_folder(
         Field(
             description="File extensions to index, e.g. ['.pdf', '.md']. "
                         "Defaults to all supported types: .txt, .md, .pdf, "
-                        ".docx, .pptx, .pst, .mbox. Spreadsheets "
+                        ".docx, .pptx, .pst. Spreadsheets "
                         "(.csv/.xlsx/.xlsm/.xls) are temporarily disabled "
-                        "and are silently filtered out even if passed here.",
+                        "and are silently filtered out even if passed here. "
+                        "Mbox files (.mbox) are preprocessed into a sibling "
+                        "<stem>_unpacked/ tree of .txt files + attachments, "
+                        "which are then indexed via their native types.",
             default=None,
         ),
     ] = None,
@@ -109,9 +112,16 @@ async def index_folder(
     """Start a background job to index or re-index all documents in a folder.
 
     Scans the folder for supported document types (.txt, .md, .pdf, .docx,
-    .pptx, .pst, .mbox), extracts text, splits into chunks, computes embeddings,
+    .pptx, .pst), extracts text, splits into chunks, computes embeddings,
     stores them in a local vector database, and builds an ANN index for fast
     search. Only files that have changed since the last run are re-processed.
+
+    `.mbox` files are preprocessed: each one is unpacked into a sibling
+    `<stem>_unpacked/` tree (per-thread directories, one `.txt` per message,
+    attachments under `attachments/msg-NNNN/`) before the walk. The `.txt`
+    files (and the attachments via their native parsers) are what gets
+    indexed — the `.mbox` itself is not. The unpacked tree is refreshed
+    only when the `.mbox` is newer than the dir (mtime comparison).
 
     Spreadsheet indexing (.csv, .xlsx, .xlsm, .xls) is temporarily disabled.
     These files are not discovered during a run, even if a caller passes
