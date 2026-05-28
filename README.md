@@ -192,10 +192,44 @@ Works the same with PDFs, Word docs, PowerPoints, and CSVs -- just point it at a
 
 | Tool | Description |
 |------|-------------|
-| `index_folder` | Index or re-index all documents in a folder. Incremental -- skips unchanged files. Honours a `.semanticignore` at the folder root and an optional `exclude` parameter (see [Excluding files](#excluding-files-and-folders) below). |
+| `index_folder` | Index or re-index all documents in a folder. Incremental -- skips unchanged files. Honours a `.semanticignore` at the folder root and an optional `exclude` parameter (see [Excluding files](#excluding-files-and-folders) below). Pass `unpack_first=false` to skip the pst/mbox/msg preprocessing pass (useful when the unpacked trees were prepared by `csemsearch unpack`). |
 | `semantic_search` | Search indexed documents using natural language. Supports `vector` and `hybrid` modes. |
 | `get_index_status` | Show total chunks, file count, indexed files, index size on disk, and background-job history. Pass `folder_path` to also surface the active `.semanticignore` for that folder. |
 | `reindex_file` | Force re-index a single file, bypassing the hash cache. Bypasses exclusion rules -- this is an explicit per-file act. |
+
+## Command line — `csemsearch`
+
+For long-running indexing over large corpora, the `csemsearch` CLI runs the same code path the MCP tools use but with a live progress bar, phase headers, per-file chunk counters, and Ctrl-C cancellation. The MCP server stays the right entry point for ad-hoc agent calls; the CLI is the right entry point for hand-driven runs you want to watch.
+
+```
+$ csemsearch index ~/Documents/work
+[12:34:01] Indexing /Users/p/Documents/work
+[12:34:01]   db_path:        /Users/p/.lancedb
+[12:34:01]   recursive:      True
+[12:34:01]   indexing  ━━━━━━━━━━━━━━━━━  73% 618/847 12.3 file/s
+                       current: invoices/2024-Q3/acme-statement.pdf
+[12:44:48] Done in 647.21s
+[12:44:48]   indexed       224 files   2,819 chunks
+[12:44:48]   skipped       621 files
+[12:44:48]   total chunks  14,221
+```
+
+| Verb | Synopsis |
+|---|---|
+| `csemsearch unpack <folder>` | Run only the pst → mbox → msg preprocessing passes. One progress bar per phase. |
+| `csemsearch index <folder>` | Index (or incrementally re-index) the folder. `--no-unpack` skips preprocessing. `--exclude PAT` (repeatable) and `--types EXT` (repeatable) mirror the MCP options. `--safe-flush` persists each file's chunks immediately for crash-bounded long runs. |
+| `csemsearch run <folder>` | Sugar for `unpack` then `index --no-unpack`. Same one-shot semantics the MCP tool has. |
+| `csemsearch search "<query>"` | Print top results. `--mode hybrid` for vector+BM25 RRF. `-n 10` to control the count. `--folder <path>` to scope results. |
+| `csemsearch status` | Index size, chunk/file counts, last ten jobs from the persistent registry. |
+| `csemsearch reindex <file>` | Force-reindex one file (bypasses the hash cache). |
+
+Global options: `--db-path` (overrides `LANCEDB_PATH`), `--verbose` (show DEBUG), `--quiet` (show only WARNING+). All output goes to stderr so `csemsearch search ... > results.txt` redirects only the hit list.
+
+**Cancellation.** Pressing Ctrl-C during `index` flips an internal flag the indexer checks at every file boundary, flushes the in-flight chunk buffer, marks the job as `interrupted` in the registry, and exits 130. The next run picks up where the cancelled one left off — files already committed are skipped via the hash cache. A second Ctrl-C re-raises so a hung process can still be force-quit.
+
+**Concurrency.** `index` and `reindex` refuse to start while a live indexing job is in progress against the same index (whether spawned by the MCP server or another `csemsearch` invocation) — two writers on a LanceDB index would corrupt it.
+
+**Running without `pip install -e`.** The CLI is also reachable as `python -m cli.main` when the console script hasn't been installed (e.g. uv-managed dev envs without a `[build-system]` section).
 
 ## How It Works
 
@@ -349,7 +383,7 @@ source .venv/bin/activate
 pytest tests/ -v
 ```
 
-180 tests covering parsers, chunking, indexing, search, path portability, exclusion rules, background indexing jobs, and MCP tool integration.
+~400 tests covering parsers, chunking, indexing, search, path portability, exclusion rules, background indexing jobs, MCP tool integration, the CLI verbs, and unpack-pass orchestration.
 
 Contributions welcome -- open an issue or submit a PR.
 
