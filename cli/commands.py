@@ -279,6 +279,7 @@ def index_cmd(
     Re-running picks up where it left off via the hash cache."""
     from cli.progress import ProgressBar
     from server.indexer import index_folder, ProgressEvent
+    from server.jobs import JobRegistry
 
     folder_path = Path(folder).expanduser().resolve()
     if not folder_path.is_dir():
@@ -302,6 +303,15 @@ def index_cmd(
     if safe_flush:
         logger.info("  safe_flush:     True (every file persisted immediately)")
 
+    # Register a job in the on-disk registry so `csemsearch status` (and an
+    # MCP `get_index_status` call against the same index) shows CLI runs the
+    # same way they show MCP background jobs. The registry is the contract
+    # both sides observe to enforce single-writer semantics.
+    jobs_path = db_path + ".jobs.json"
+    cli_registry = JobRegistry(persist_path=jobs_path)
+    job = cli_registry.create(str(folder_path), db_path)
+    logger.debug("registered job %s", job.job_id)
+
     cancel, previous_handler = _install_sigint_handler()
     bar: ProgressBar | None = None
     last_event: ProgressEvent | None = None
@@ -312,23 +322,37 @@ def index_cmd(
         if bar is None:
             bar = ProgressBar(total=event.total, desc="  indexing", unit="file")
         bar.set_to(event.processed, postfix=event.current_file or "")
+        # Update job progress so `status` reflects live state. Mirrors what
+        # the MCP _run_index_job does — JobRegistry throttles writes itself.
+        cli_registry.update_progress(job.job_id, event.processed, event.total)
 
     try:
-        result = index_folder(
-            str(folder_path),
-            file_types=file_types,
-            recursive=recursive,
-            db_path=db_path,
-            exclude=exclude,
-            unpack_first=unpack_first,
-            progress_event_callback=on_event,
-            cancel_event=cancel,
-            flush_threshold=1 if safe_flush else None,
-        )
+        try:
+            result = index_folder(
+                str(folder_path),
+                file_types=file_types,
+                recursive=recursive,
+                db_path=db_path,
+                exclude=exclude,
+                unpack_first=unpack_first,
+                progress_event_callback=on_event,
+                cancel_event=cancel,
+                flush_threshold=1 if safe_flush else None,
+            )
+        except Exception as e:
+            cli_registry.mark_failed(job.job_id, str(e))
+            raise
     finally:
         if bar is not None:
             bar.close()
         _restore_handler(previous_handler)
+
+    if result.get("cancelled"):
+        cli_registry.mark_failed(job.job_id, "cancelled by SIGINT")
+    else:
+        cli_registry.mark_completed(
+            job.job_id, result, result.get("finalize_warnings", [])
+        )
 
     cancelled = result.get("cancelled", False)
     total_files = last_event.total if last_event is not None else 0

@@ -450,12 +450,18 @@ def index_folder(
                 )
             )
 
+    # Files the loop is past (processed, skipped, or failed during this iter).
+    # On a clean run this hits len(files). On cancel, this is what the final
+    # progress tick reports — so a CLI bar freezes at the truncation point
+    # instead of jumping to 100%.
+    files_seen = 0
     for idx, file_path in enumerate(files):
         # Cancel at file boundaries: the post-loop block still flushes the
         # buffer so any work completed in the previous iteration persists.
         if cancel_event is not None and cancel_event.is_set():
             cancelled = True
             break
+        files_seen = idx + 1
         if progress_callback is not None:
             progress_callback(idx, len(files))
         try:
@@ -592,9 +598,12 @@ def index_folder(
         chunks_written += len(buffer)
         buffer = []
 
+    # Final tick. On a clean run files_seen == len(files); on cancel it sits
+    # at the index where the loop broke, so a progress bar freezes at the
+    # truncation point rather than jumping to 100%.
     if progress_callback is not None:
-        progress_callback(len(files), len(files))
-    _emit_event(len(files), None)
+        progress_callback(files_seen, len(files))
+    _emit_event(files_seen, None)
 
     # Orphan-cleanup deletes index rows for files no longer visited under
     # `folder`. Skipped on a cancelled run — `current_files` is a partial

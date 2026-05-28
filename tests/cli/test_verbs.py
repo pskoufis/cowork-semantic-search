@@ -188,6 +188,38 @@ def test_index_safe_flush_passes_threshold_one(small_corpus, tmp_path):
     assert seen_thresholds == [1]
 
 
+def test_index_registers_job_for_status_visibility(small_corpus, tmp_path, capsys):
+    """A successful `csemsearch index` run must land as a completed job in
+    the on-disk registry so `csemsearch status` (and the MCP
+    get_index_status tool) shows it. Before this, only MCP background
+    jobs appeared in the history."""
+    db = tmp_path / "lancedb"
+    assert main(["--db-path", str(db), "index", str(small_corpus)]) == 0
+
+    jobs_file = Path(str(db) + ".jobs.json")
+    assert jobs_file.exists(), "CLI index must persist a job record"
+    payload = json.loads(jobs_file.read_text())
+    assert payload, "registry file must contain at least one job entry"
+    last = payload[-1]
+    assert last["state"] == "completed"
+    assert last["folder_path"] == str(small_corpus.resolve())
+    assert last["files_total"] >= 3
+    assert last["files_processed"] == last["files_total"]
+
+
+def test_status_lists_cli_jobs_after_run(small_corpus, tmp_path, capsys):
+    """`status` formatted-table output includes the job the CLI just ran."""
+    db = tmp_path / "lancedb"
+    assert main(["--db-path", str(db), "index", str(small_corpus)]) == 0
+    capsys.readouterr()
+
+    rc = main(["--db-path", str(db), "status"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "Recent jobs" in captured.out
+    assert "completed" in captured.out
+
+
 # ---------------------------------------------------------------------------
 # search
 # ---------------------------------------------------------------------------

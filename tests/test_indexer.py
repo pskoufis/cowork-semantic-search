@@ -1039,10 +1039,19 @@ def test_index_folder_cancel_event_stops_loop_at_next_boundary(
         if event.current_file is not None and not cancel.is_set():
             cancel.set()
 
+    captured_events: list[ProgressEvent] = []
+    seen_files.clear()
+
+    def cb_capturing(event: ProgressEvent) -> None:
+        captured_events.append(event)
+        seen_files.append(event.current_file)
+        if event.current_file is not None and not cancel.is_set():
+            cancel.set()
+
     result = index_folder(
         str(docs_dir),
         db_path=str(tmp_path / "testdb"),
-        progress_event_callback=cb,
+        progress_event_callback=cb_capturing,
         cancel_event=cancel,
     )
 
@@ -1051,6 +1060,21 @@ def test_index_folder_cancel_event_stops_loop_at_next_boundary(
     # At least one file got indexed before the cancel landed. The rest
     # didn't. A re-run will pick them up.
     assert 1 <= result["files_indexed"] < 4
+
+    # The final ProgressEvent must sit at the truncation point, NOT at
+    # processed == total. Otherwise a CLI bar driven by these events would
+    # paint a misleading "100% complete" right before the cancellation
+    # summary prints.
+    final = captured_events[-1]
+    assert final.current_file is None, "final tick still has current_file=None"
+    assert final.processed < final.total, (
+        f"final tick reported {final.processed}/{final.total} on cancel; "
+        "expected processed < total so the bar freezes mid-run."
+    )
+    assert final.processed == result["files_indexed"], (
+        "final tick's processed count must match files_indexed so the "
+        "summary line and bar agree."
+    )
 
 
 @patch("server.indexer.get_model")
