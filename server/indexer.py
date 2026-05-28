@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from mbox_handling.unpack import ensure_unpacked
+from mbox_handling.unpack import ensure_unpacked as ensure_mbox_unpacked
+from msg_handling.unpack import ensure_unpacked as ensure_msg_unpacked
 from server.parsers import extract_text, SUPPORTED_EXTENSIONS
 from server.chunker import chunk_document
 from server.exclusions import ExclusionRules
@@ -232,10 +233,55 @@ def _ensure_mboxes_unpacked(
             ):
                 continue
             try:
-                ensure_unpacked(mbox_path)
+                ensure_mbox_unpacked(mbox_path)
             except Exception as e:
                 print(
                     f"warning: failed to unpack {mbox_path}: {e}",
+                    file=sys.stderr,
+                )
+
+
+def _ensure_msgs_unpacked(
+    folder: Path,
+    *,
+    recursive: bool,
+    exclusions: ExclusionRules | None,
+) -> None:
+    """Walk ``folder`` for ``*.msg`` files and ensure each has a fresh
+    sibling ``<stem>.txt`` + ``attachments/<stem>__*`` layout before the
+    main indexer walk runs.
+
+    Mirrors :func:`_ensure_mboxes_unpacked` — same recursive/exclusion
+    semantics, same per-file isolation (one broken .msg logs and is
+    skipped). Cannot reuse ``discover_files`` because ``.msg`` is not in
+    ``SUPPORTED_EXTENSIONS`` (the unpacked ``.txt`` files are what gets
+    indexed). Runs *after* the mbox preprocessing pass so any ``.msg``
+    files surfaced by mbox unpacking (mbox messages can carry ``.msg``
+    attachments) are still caught.
+    """
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dpath = Path(dirpath)
+        if recursive:
+            if exclusions is not None:
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not exclusions.is_excluded(dpath / d, folder, is_dir=True)
+                ]
+        else:
+            dirnames[:] = []
+        for name in filenames:
+            if not name.lower().endswith(".msg"):
+                continue
+            msg_path = dpath / name
+            if exclusions is not None and exclusions.is_excluded(
+                msg_path, folder, is_dir=False
+            ):
+                continue
+            try:
+                ensure_msg_unpacked(msg_path)
+            except Exception as e:
+                print(
+                    f"warning: failed to unpack {msg_path}: {e}",
                     file=sys.stderr,
                 )
 
@@ -264,6 +310,11 @@ def index_folder(
     # sibling <stem>_unpacked/ tree. The main walk then sees the .txt
     # files (and materialized attachments) instead of the .mbox itself.
     _ensure_mboxes_unpacked(folder, recursive=recursive, exclusions=exclusions)
+    # Second preprocessing pass: every .msg under the corpus gets a fresh
+    # sibling <stem>.txt + attachments/<stem>__* layout. Runs after the
+    # mbox pass so .msg files surfaced inside an unpacked mbox tree (mbox
+    # messages can carry .msg attachments) are still caught.
+    _ensure_msgs_unpacked(folder, recursive=recursive, exclusions=exclusions)
 
     store = VectorStore(db_dir)
     store.ensure_schema()  # migrate older indexes in place, if needed
