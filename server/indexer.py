@@ -200,6 +200,119 @@ def embed_chunks(chunks: list[dict]) -> list[dict]:
     return chunks
 
 
+def reindex_one_file(file_path: str, db_path: str | None = None) -> dict:
+    """Force re-index a single file, bypassing the hash cache.
+
+    Shared by the MCP ``reindex_file`` tool and the CLI ``reindex`` verb.
+    Both need identical behavior — concurrency check, size-cap, "inside
+    index dir" guard, spreadsheet queue path, normal embed path.
+
+    Returns a result dict the caller can convert to its own form
+    (MCP tool response shape, CLI exit-code/log).
+    """
+    from server.jobs import registry
+    from server.spreadsheets import (
+        SPREADSHEET_EXTENSIONS,
+        UnreadableSpreadsheetError,
+        extract_preview,
+        needs_for_preview,
+    )
+
+    if registry.has_running():
+        active = registry.active()
+        return {
+            "status": "rejected",
+            "message": (
+                "An indexing job is running; retry once it finishes."
+            ),
+            "running_job_id": active[0].job_id if active else None,
+        }
+
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    if db_path is None:
+        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+    db_dir = os.path.abspath(db_path)
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    db_resolved = Path(db_dir).resolve() if Path(db_dir).exists() else Path(db_dir)
+    if resolved.is_relative_to(db_resolved):
+        return {
+            "status": "rejected",
+            "reason": "inside_index_dir",
+            "file_path": file_path,
+            "message": (
+                "file_path is inside the active LanceDB directory; "
+                "reindex refuses to parse the index's own files."
+            ),
+        }
+
+    stat = path.stat()
+    if exceeds_size_cap(path, stat.st_size):
+        return {
+            "status": "skipped",
+            "file_path": file_path,
+            "reason": (
+                f"file is {stat.st_size / 1024 / 1024:.1f} MB, over the "
+                f"{MAX_FILE_SIZE_BYTES // 1024 // 1024} MB indexing cap "
+                f"(set via the MAX_FILE_SIZE_MB env var)"
+            ),
+            "chunks_created": 0,
+        }
+
+    source_rel = to_relative(str(path), db_dir)
+
+    store = VectorStore(db_dir)
+    store.ensure_schema()
+    store.delete_by_file(source_rel)
+
+    if path.suffix.lower() in SPREADSHEET_EXTENSIONS:
+        try:
+            preview = extract_preview(path)
+        except UnreadableSpreadsheetError as exc:
+            return {
+                "status": "failed",
+                "file_path": file_path,
+                "reason": f"unreadable spreadsheet: {exc}",
+            }
+        file_hash = compute_file_hash(path)
+        needs = needs_for_preview(preview)
+        store.enqueue_pending(
+            file_path=source_rel,
+            needs=needs,
+            preview_json=json.dumps(preview),
+            content_hash=file_hash,
+        )
+        return {
+            "status": "queued",
+            "file_path": file_path,
+            "needs": needs,
+        }
+
+    parts = extract_text(path)
+    chunks = chunk_document(parts, source_rel)
+    file_hash = compute_file_hash(path)
+
+    if chunks:
+        chunks = embed_chunks(chunks)
+        for c in chunks:
+            c["content_hash"] = file_hash
+            c["mtime_ns"] = stat.st_mtime_ns
+            c["file_size"] = stat.st_size
+        store.add_chunks(chunks)
+
+    return {
+        "status": "reindexed",
+        "file_path": file_path,
+        "chunks_created": len(chunks),
+    }
+
+
 def _finalize_index(
     store: VectorStore, *, content_changed: bool, stats_changed: bool
 ) -> list[str]:
@@ -238,6 +351,7 @@ def index_folder(
     unpack_first: bool = True,
     progress_event_callback: Callable[[ProgressEvent], None] | None = None,
     cancel_event: threading.Event | None = None,
+    flush_threshold: int | None = None,
 ) -> dict:
     folder = Path(folder_path)
     if not folder.exists():
@@ -316,6 +430,12 @@ def index_folder(
     buffer: list[dict] = []  # chunks awaiting a batched write
     chunks_written = 0       # cumulative chunks committed via store.add_chunks
     cancelled = False        # set when cancel_event is observed at a file boundary
+    # Per-run override of FLUSH_CHUNK_THRESHOLD. The CLI's `--safe-flush` sets
+    # this to 1 so each file's chunks land on disk immediately — slower for
+    # many-small-files corpora, but bounds work-loss on a hard kill.
+    effective_flush_threshold = (
+        flush_threshold if flush_threshold is not None else FLUSH_CHUNK_THRESHOLD
+    )
 
     def _emit_event(processed: int, current: str | None) -> None:
         if progress_event_callback is not None:
@@ -326,7 +446,7 @@ def index_folder(
                     current_file=current,
                     chunks_written=chunks_written,
                     buffer_fill=len(buffer),
-                    flush_threshold=FLUSH_CHUNK_THRESHOLD,
+                    flush_threshold=effective_flush_threshold,
                 )
             )
 
@@ -459,7 +579,7 @@ def index_folder(
 
         # Flush the buffer once it is large enough. A failed batched write is a
         # systemic error and is left to propagate (fails the job).
-        if len(buffer) >= FLUSH_CHUNK_THRESHOLD:
+        if len(buffer) >= effective_flush_threshold:
             store.add_chunks(buffer)
             chunks_written += len(buffer)
             buffer = []
