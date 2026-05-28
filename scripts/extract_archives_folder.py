@@ -33,6 +33,7 @@ Invariants:
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 import time
@@ -51,7 +52,13 @@ from msg_handling.unpack import ensure_unpacked as _unpack_msg  # noqa: E402
 from pst_handling.unpack import ensure_unpacked as _unpack_pst  # noqa: E402
 
 # Suffix (lowercased) -> archive kind. Order is irrelevant; lookup is by suffix.
-_KINDS = {".mbox": "mbox", ".pst": "pst", ".msg": "msg", ".zip": "zip"}
+_KINDS = {".mbox": "mbox", ".pst": "pst", ".msg": "msg", ".zip": "zip",
+          ".rar": "rar"}
+
+# Secondary volumes of a multi-volume rar set (foo.part2.rar, foo.part02.rar,
+# ...). Only the first volume is processed — it pulls in the whole set, while
+# opening a later volume directly errors. Matches ``.partN.rar`` with N > 1.
+_RAR_SECONDARY_VOLUME = re.compile(r"\.part0*(\d+)\.rar$", re.IGNORECASE)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -154,6 +161,8 @@ def _process(path: Path, kind: str, target: Path) -> None:
     fully-resolved destination computed by ``_target_for``."""
     if kind == "zip":
         _extract_zip(path, target)
+    elif kind == "rar":
+        _extract_rar(path, target)
     elif kind == "msg":
         _unpack_msg(path, target=target)
         # ``msg_handling.ensure_unpacked`` swallows parse failures (logs to
@@ -185,7 +194,7 @@ def _target_for(path: Path, kind: str, *, from_input: bool,
     else:
         parent = path.parent
 
-    if kind == "zip":
+    if kind in ("zip", "rar"):
         return parent / path.stem
     if kind == "msg":
         return parent
@@ -219,6 +228,48 @@ def _extract_zip(zip_path: Path, target: Path) -> None:
                 outf.write(srcf.read())
 
 
+def _extract_rar(rar_path: Path, target: Path) -> None:
+    """Extract ``rar_path`` into ``target`` preserving internal structure.
+
+    A near-clone of :func:`_extract_zip`, including the per-member
+    path-traversal guard. ``.rar`` is not in the stdlib: it needs the
+    optional ``rarfile`` package plus a system backend (``unar``/``unrar``;
+    the already-present ``bsdtar`` also works for many archives). Both the
+    missing-package and missing-backend cases raise a friendly hint, caught
+    per-file by the caller's error isolation.
+    """
+    try:
+        import rarfile
+    except ImportError as exc:  # package not installed
+        raise RuntimeError(
+            "rar support needs the 'rarfile' package: "
+            "pip install 'cowork-semantic-search[rar]'"
+        ) from exc
+
+    target = target.resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        with rarfile.RarFile(rar_path) as rf:
+            for member in rf.infolist():
+                dest = (target / member.filename).resolve()
+                if dest != target and target not in dest.parents:
+                    raise ValueError(
+                        f"unsafe path in {rar_path.name}: "
+                        f"{member.filename!r} escapes the extraction directory"
+                    )
+                if member.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with rf.open(member) as srcf, open(dest, "wb") as outf:
+                    outf.write(srcf.read())
+    except rarfile.RarCannotExec as exc:  # no usable backend tool
+        raise RuntimeError(
+            "rarfile found no usable backend; install one, "
+            "e.g. 'brew install unar'"
+        ) from exc
+
+
 def _copy_other_files(src: Path, dst: Path, *, dry_run: bool) -> tuple[int, int]:
     """Copy every non-archive file under ``src`` into ``dst`` preserving the
     relative path. Archive types (handled by extraction) are skipped. A
@@ -230,6 +281,8 @@ def _copy_other_files(src: Path, dst: Path, *, dry_run: bool) -> tuple[int, int]
     for p in sorted(src.rglob("*")):
         if not p.is_file():
             continue
+        if _is_macos_junk(p):
+            continue  # AppleDouble / .DS_Store / __MACOSX — never content
         if p.suffix.lower() in _KINDS:
             continue  # archives are extracted, not copied
         rel = p.relative_to(src)
@@ -261,10 +314,31 @@ def _discover(root: Path) -> list[tuple[Path, str]]:
     for p in sorted(root.rglob("*")):
         if not p.is_file():
             continue
+        if _is_macos_junk(p):
+            continue  # AppleDouble / .DS_Store / __MACOSX — not real archives
         kind = _KINDS.get(p.suffix.lower())
-        if kind is not None:
-            found.append((p.resolve(), kind))
+        if kind is None:
+            continue
+        if kind == "rar" and _is_secondary_rar_volume(p):
+            continue  # only the first volume of a multi-volume set
+        found.append((p.resolve(), kind))
     return found
+
+
+def _is_macos_junk(path: Path) -> bool:
+    """True for macOS filesystem metadata that is never real content:
+    AppleDouble ``._*`` sidecars (created on non-HFS volumes), ``.DS_Store``,
+    and anything inside a ``__MACOSX/`` directory."""
+    if path.name.startswith("._") or path.name == ".DS_Store":
+        return True
+    return "__MACOSX" in path.parts
+
+
+def _is_secondary_rar_volume(path: Path) -> bool:
+    """True for ``foo.partN.rar`` with N > 1 — a continuation volume that
+    must not be opened directly (the first volume pulls in the whole set)."""
+    m = _RAR_SECONDARY_VOLUME.search(path.name)
+    return m is not None and int(m.group(1)) > 1
 
 
 def _remaining(root: Path, processed: set[Path]) -> bool:

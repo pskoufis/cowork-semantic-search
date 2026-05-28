@@ -31,7 +31,8 @@ python scripts/extract_archives_folder.py <input-folder> <output-folder> \
 ## Reuse, not reinvention
 
 Imports `ensure_unpacked` from `mbox_handling`, `msg_handling`, `pst_handling`;
-uses stdlib `zipfile` directly for zips. No duplicated extraction logic.
+uses stdlib `zipfile` for zips and the optional `rarfile` package for rars. No
+duplicated extraction logic.
 
 ## Per-type output (mirrors input layout)
 
@@ -41,6 +42,7 @@ uses stdlib `zipfile` directly for zips. No duplicated extraction logic.
 | `.mbox` | `<out>/<rel_parent>/<stem>_unpacked/` (thread tree)                |
 | `.pst`  | `<out>/<rel_parent>/<stem>_unpacked/` (folder tree)                |
 | `.zip`  | `<out>/<rel_parent>/<stem>/` (internal structure preserved)        |
+| `.rar`  | `<out>/<rel_parent>/<stem>/` (internal structure preserved)        |
 
 Deliberate deviation: the standalone `unpack_mbox_folder.py` *flattens* mbox to
 `<out>/<stem>/`; this unified script *mirrors* (`<out>/<rel>/<stem>_unpacked/`).
@@ -68,7 +70,15 @@ Deliberate deviation: the standalone `unpack_mbox_folder.py` *flattens* mbox to
 - **Input tree is never modified** — all writes go to output.
 - Reject `output inside input` — with output-tree scanning that is a real
   feedback loop, not just untidy.
-- Path-traversal guard on zip entries (reject entries escaping target dir).
+- Path-traversal guard on zip **and rar** entries (reject entries escaping the
+  target dir).
+- **macOS metadata skip:** AppleDouble `._*` sidecars (created on exFAT/FAT
+  volumes), `.DS_Store`, and anything under a `__MACOSX/` folder are skipped in
+  both archive discovery and `--copy-others`. Without this, a `._foo.zip`
+  sidecar is mistaken for a real zip and fails with "File is not a zip file".
+- **Multi-volume rar:** only the first volume of a set is processed. Discovery
+  skips `foo.partN.rar` where N > 1 (the first volume pulls in the whole set;
+  opening a later volume directly would error and inflate the failure count).
 - Known asymmetry (documented, not "fixed"): top-level email *sources* stay in
   input (only derived `.txt` lands in output); zip-nested email sources get
   copied into output by extraction, so they sit beside their `.txt`. Fine for
@@ -98,6 +108,11 @@ exit non-zero if any file failed. Matches existing batch-script convention.
    are still extracted; without the flag they are left behind; archive
    originals are not copied.
 10. A re-run with `--copy-others` does not re-copy an up-to-date destination.
+11. `.rar` is a recognised kind and `_extract_rar` raises a friendly
+    `pip install ...[rar]` hint when `rarfile` is absent.
+12. Discovery skips macOS metadata (`._*`, `.DS_Store`, `__MACOSX/`).
+13. Discovery keeps `a.part1.rar`/`b.part01.rar` but skips secondary volumes.
+14. `--copy-others` does not copy macOS metadata junk.
 
 Per-type unpacking internals are already covered by existing tests.
 
@@ -106,3 +121,11 @@ Per-type unpacking internals are already covered by existing tests.
 target convention, verified by test 7), but it is **not exercised
 end-to-end here** because `pypff`/`libratom` are not installed in this
 environment.
+
+**rar caveat:** `.rar` needs the optional `rarfile` package plus a system
+backend (`unar`/`unrar`; the system `bsdtar` also works for many archives).
+`_extract_rar` is a verbatim port of the end-to-end-tested `_extract_zip`
+(same path-traversal guard), but a real rar round-trip is **not exercised
+here** — creating a `.rar` requires the proprietary `rar` compressor, which
+is not installed (same unit-only strategy as `.pst`). Install for real use
+with `pip install 'cowork-semantic-search[rar]'` + `brew install unar`.

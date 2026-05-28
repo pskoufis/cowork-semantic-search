@@ -26,6 +26,9 @@ pptx = ["python-pptx>=1.0,<2.0"]
 # Xcode command-line tools are required to install this extra.
 pst = ["libpff-python>=20231205"]
 msg = ["extract-msg>=0.50,<1.0"]
+# rarfile wraps a system backend (unar/unrar/bsdtar/7z) — install one too,
+# e.g. `brew install unar`. Used by scripts/extract_archives_folder.py.
+rar = ["rarfile>=4.0,<5.0"]
 # Used by scripts/images_to_pdf.py to convert image files into PDFs.
 # pillow-heif registers the HEIC/HEIF decoders Pillow lacks out of the box.
 images = ["pillow>=10,<13", "pillow-heif>=1.0,<2.0"]
@@ -38,6 +41,7 @@ all = [
     "python-pptx>=1.0,<2.0",
     "libpff-python>=20231205",
     "extract-msg>=0.50,<1.0",
+    "rarfile>=4.0,<5.0",
     "pillow>=10,<13",
     "pillow-heif>=1.0,<2.0",
     "tqdm>=4.66",
