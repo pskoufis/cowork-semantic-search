@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -44,6 +46,33 @@ MAX_FILE_SIZE_BYTES = _MAX_FILE_SIZE_MB * 1024 * 1024 if _MAX_FILE_SIZE_MB > 0 e
 # pst_handling unpacker streams attachments directly to disk in 1 MB chunks
 # (see pst_handling.messages.ParsedPstAttachment.write_to).
 STREAMING_EXTENSIONS = {".csv", ".xlsx", ".xlsm", ".xls"}
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """Snapshot of indexing progress emitted to ``progress_event_callback``.
+
+    The CLI uses these fields to drive a richer progress UI than the
+    two-int ``progress_callback`` allows — the current file's name keeps
+    the user oriented on slow files, and the chunk/buffer counters give a
+    live "writes happening" indicator even when the file count stalls.
+
+    Fields:
+      processed: files processed (started or skipped) so far in this run.
+      total: total file count.
+      current_file: relative path of the file about to be processed; None
+        on the final tick when the loop is done.
+      chunks_written: cumulative chunks committed to the store.
+      buffer_fill: chunks currently buffered awaiting a flush.
+      flush_threshold: at what buffer fill the next flush triggers.
+    """
+
+    processed: int
+    total: int
+    current_file: str | None = None
+    chunks_written: int = 0
+    buffer_fill: int = 0
+    flush_threshold: int = 0
 
 
 def exceeds_size_cap(file_path: Path, size: int) -> bool:
@@ -207,6 +236,8 @@ def index_folder(
     progress_callback: Callable[[int, int], None] | None = None,
     exclude: list[str] | None = None,
     unpack_first: bool = True,
+    progress_event_callback: Callable[[ProgressEvent], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     folder = Path(folder_path)
     if not folder.exists():
@@ -283,10 +314,38 @@ def index_folder(
     oversized_files = []  # files skipped for exceeding MAX_FILE_SIZE_BYTES
     current_files = set()  # storage form returned by to_relative (relative same-volume, absolute cross-volume)
     buffer: list[dict] = []  # chunks awaiting a batched write
+    chunks_written = 0       # cumulative chunks committed via store.add_chunks
+    cancelled = False        # set when cancel_event is observed at a file boundary
+
+    def _emit_event(processed: int, current: str | None) -> None:
+        if progress_event_callback is not None:
+            progress_event_callback(
+                ProgressEvent(
+                    processed=processed,
+                    total=len(files),
+                    current_file=current,
+                    chunks_written=chunks_written,
+                    buffer_fill=len(buffer),
+                    flush_threshold=FLUSH_CHUNK_THRESHOLD,
+                )
+            )
 
     for idx, file_path in enumerate(files):
+        # Cancel at file boundaries: the post-loop block still flushes the
+        # buffer so any work completed in the previous iteration persists.
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            break
         if progress_callback is not None:
             progress_callback(idx, len(files))
+        try:
+            # Relative-to-folder path for the progress UI. Falls back to
+            # the filename if the file isn't a descendant of folder (rare —
+            # symlinks pointing outside, mostly).
+            display = file_path.relative_to(folder).as_posix()
+        except ValueError:
+            display = file_path.name
+        _emit_event(idx, display)
         try:
             source_rel = to_relative(str(file_path), db_dir)
         except ValueError as e:  # file on a different volume than the index
@@ -402,45 +461,53 @@ def index_folder(
         # systemic error and is left to propagate (fails the job).
         if len(buffer) >= FLUSH_CHUNK_THRESHOLD:
             store.add_chunks(buffer)
+            chunks_written += len(buffer)
             buffer = []
 
     # Flush remaining chunks before orphan-cleanup and the final counts so they
-    # see every written chunk.
+    # see every written chunk. This block also runs after a cancel so any
+    # work the loop completed before the break persists to disk.
     if buffer:
         store.add_chunks(buffer)
+        chunks_written += len(buffer)
         buffer = []
 
     if progress_callback is not None:
         progress_callback(len(files), len(files))
+    _emit_event(len(files), None)
 
-    # Clean up chunks for files deleted from within this folder only.
-    # Stored paths may be relative (same-volume) or absolute (cross-volume);
-    # to_absolute handles both before the scope check.
-    # Skip excluded paths so the prune-pass count and this orphan count never
-    # claim the same file: an excluded file is already gone from the store by
-    # the time we reach here, but the guard makes the intent explicit.
-    # Also skip files whose type isn't currently indexable — without this
-    # guard, disabling a file type (e.g. spreadsheets) would silently delete
-    # every existing chunk of that type on the next run.
-    for f_rel in store.get_all_files():
-        if Path(f_rel).suffix.lower() not in SUPPORTED_EXTENSIONS:
-            continue
-        f_abs_raw = Path(to_absolute(f_rel, db_dir))
-        try:
-            f_abs = f_abs_raw.resolve()
-        except OSError:
-            f_abs = f_abs_raw
-        in_scope = (
-            f_abs.is_relative_to(folder_resolved) if recursive
-            else f_abs.parent == folder_resolved
-        )
-        if not in_scope:
-            continue
-        if exclusions.is_excluded(f_abs, folder_resolved, is_dir=False):
-            continue
-        if f_rel not in current_files:
-            store.delete_by_file(f_rel)
-            deleted += 1
+    # Orphan-cleanup deletes index rows for files no longer visited under
+    # `folder`. Skipped on a cancelled run — `current_files` is a partial
+    # set in that case, so running cleanup would wrongly delete every file
+    # the loop didn't reach.
+    if not cancelled:
+        # Stored paths may be relative (same-volume) or absolute (cross-volume);
+        # to_absolute handles both before the scope check.
+        # Skip excluded paths so the prune-pass count and this orphan count never
+        # claim the same file: an excluded file is already gone from the store by
+        # the time we reach here, but the guard makes the intent explicit.
+        # Also skip files whose type isn't currently indexable — without this
+        # guard, disabling a file type (e.g. spreadsheets) would silently delete
+        # every existing chunk of that type on the next run.
+        for f_rel in store.get_all_files():
+            if Path(f_rel).suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            f_abs_raw = Path(to_absolute(f_rel, db_dir))
+            try:
+                f_abs = f_abs_raw.resolve()
+            except OSError:
+                f_abs = f_abs_raw
+            in_scope = (
+                f_abs.is_relative_to(folder_resolved) if recursive
+                else f_abs.parent == folder_resolved
+            )
+            if not in_scope:
+                continue
+            if exclusions.is_excluded(f_abs, folder_resolved, is_dir=False):
+                continue
+            if f_rel not in current_files:
+                store.delete_by_file(f_rel)
+                deleted += 1
 
     # Finalize: compact, and rebuild indexes when index content changed.
     finalize_warnings = _finalize_index(
@@ -450,7 +517,8 @@ def index_folder(
     )
 
     return {
-        "status": "completed",
+        "status": "cancelled" if cancelled else "completed",
+        "cancelled": cancelled,
         "folder_path": folder_path,
         "files_indexed": indexed,
         "files_skipped": skipped,
