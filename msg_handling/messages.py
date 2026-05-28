@@ -10,6 +10,8 @@ fixtures.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from email.utils import format_datetime
 from pathlib import Path
 from typing import Tuple
 
@@ -61,11 +63,43 @@ def read_message(msg_path: Path) -> ParsedMessage:
             to=_coerce_str(getattr(msg, "to", None)),
             cc=_coerce_str(getattr(msg, "cc", None)),
             subject=_coerce_str(getattr(msg, "subject", None)),
-            date=_coerce_str(getattr(msg, "date", None)),
+            date=_extract_date(msg),
             message_id=_coerce_str(getattr(msg, "messageId", None)),
             body=_select_body(msg),
             attachments=tuple(attachments),
         )
+
+
+def _extract_date(msg) -> str:
+    """RFC2822-format the best-available timestamp on the message.
+
+    .msg files don't always carry a ``clientSubmitTime`` (the canonical
+    "when sent" timestamp that ``msg.date`` reads). When it's missing we
+    fall back through ``receivedTime`` and the raw MAPI creation and
+    last-modification times, in that order. Returns "" when no usable
+    timestamp is available so the Date header line stays present-but-empty
+    rather than disappearing.
+    """
+    for candidate in (
+        getattr(msg, "date", None),
+        getattr(msg, "receivedTime", None),
+        _prop_datetime(msg, "30070040"),  # PR_CREATION_TIME
+        _prop_datetime(msg, "30080040"),  # PR_LAST_MODIFICATION_TIME
+    ):
+        if isinstance(candidate, datetime):
+            return format_datetime(candidate)
+    return ""
+
+
+def _prop_datetime(msg, tag: str) -> datetime | None:
+    try:
+        prop = msg.props.get(tag)
+    except Exception:
+        return None
+    if prop is None:
+        return None
+    value = getattr(prop, "value", None)
+    return value if isinstance(value, datetime) else None
 
 
 def _select_body(msg) -> str:
