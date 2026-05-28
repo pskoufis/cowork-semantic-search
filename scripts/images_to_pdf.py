@@ -16,8 +16,8 @@ Behaviour notes:
 
 * Modes that a PDF cannot store directly (RGBA / LA / P) are flattened to RGB,
   compositing any alpha channel onto a white background.
-* Multi-frame inputs (multi-page TIFF, animated GIF) convert the **first frame
-  only** and emit a ``WARN`` noting the dropped frames.
+* Multi-frame inputs (multi-page TIFF, animated GIF/WebP) become a single
+  multi-page PDF — one PDF page per frame, in order.
 * If two inputs map to the same stem (``foo.jpg`` + ``foo.png``), the second and
   later get a numeric suffix (``foo-1.pdf``, ``foo-2.pdf``) and a ``WARN`` — no
   silent overwrite.
@@ -149,27 +149,22 @@ def _unique_out_path(dst: Path, src_name: str, used_stems: set[str]) -> Path:
 
 
 def _convert_one(Image, src_path: str, out_path: Path) -> bool:
-    """Convert a single image file to ``out_path``. Returns success."""
-    from PIL import ImageOps
+    """Convert a single image file to ``out_path``. Returns success.
+
+    Multi-frame inputs (multi-page TIFF, animated GIF/WebP) become a single
+    multi-page PDF, one PDF page per frame.
+    """
+    from PIL import ImageSequence
 
     try:
         with Image.open(src_path) as img:
-            n_frames = getattr(img, "n_frames", 1)
-            if n_frames > 1:
-                print(
-                    f"WARN: {src_path} has {n_frames} frames; converting first frame only",
-                    file=sys.stderr,
-                )
-                img.seek(0)
-            # Honour the EXIF orientation tag (phone photos / scans set it) so
-            # the PDF isn't written sideways; Pillow's PDF save ignores it.
-            # Must come after frame selection — it returns a flat single-frame copy.
-            img = ImageOps.exif_transpose(img)
-            if img.mode in _NON_RGB_MODES:
-                img = _flatten_to_rgb(Image, img)
-            elif img.mode not in ("RGB", "L"):
-                img = img.convert("RGB")
-            img.save(out_path, "PDF")
+            pages = [_prepare_page(Image, frame) for frame in ImageSequence.Iterator(img)]
+            pages[0].save(
+                out_path,
+                "PDF",
+                save_all=True,
+                append_images=pages[1:],
+            )
         return True
     except Exception as exc:  # noqa: BLE001 — one bad file must not abort the run
         print(f"WARN: skipping {src_path}: {exc}", file=sys.stderr)
@@ -179,6 +174,24 @@ def _convert_one(Image, src_path: str, out_path: Path) -> bool:
         except OSError:
             pass
         return False
+
+
+def _prepare_page(Image, frame):
+    """Return a detached, PDF-ready (RGB/L) copy of one image frame.
+
+    Honours the EXIF orientation tag (phone photos / scans set it) so pages
+    aren't written sideways, and flattens alpha/palette modes onto white.
+    """
+    from PIL import ImageOps
+
+    page = ImageOps.exif_transpose(frame)
+    if page.mode in _NON_RGB_MODES:
+        page = _flatten_to_rgb(Image, page)
+    elif page.mode not in ("RGB", "L"):
+        page = page.convert("RGB")
+    # exif_transpose may return the live frame unchanged; copy so advancing the
+    # ImageSequence iterator can't mutate a page we've already collected.
+    return page.copy()
 
 
 def _flatten_to_rgb(Image, img):
