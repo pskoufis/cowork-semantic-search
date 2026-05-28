@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -192,3 +193,74 @@ def test_per_file_failure_does_not_abort_batch(
     err = capsys.readouterr().err
     assert "bad.mbox" in err
     assert "kaboom" in err
+
+
+def test_prints_found_header_with_count(tmp_path: Path, capsys) -> None:
+    from scripts.unpack_mbox_folder import main
+
+    src = tmp_path / "in"
+    src.mkdir()
+    _simple_mbox(src / "alpha.mbox")
+    _simple_mbox(src / "beta.mbox")
+    out = tmp_path / "out"
+
+    rc = main([str(src), str(out)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert re.search(r"Found 2 mbox file\(s\) under .*in", err), err
+
+
+def test_prints_per_item_progress_line(tmp_path: Path, capsys) -> None:
+    """Each mbox gets one `[i/N] unpacking <rel-path> -> <target>` line."""
+    from scripts.unpack_mbox_folder import main
+
+    src = tmp_path / "in"
+    (src / "2024").mkdir(parents=True)
+    _simple_mbox(src / "2024" / "alpha.mbox")
+    _simple_mbox(src / "beta.mbox")
+    out = tmp_path / "out"
+
+    rc = main([str(src), str(out)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    # Both files appear in a `[i/2] unpacking ...` line, with the target hint.
+    # Discovery is sorted by relative path, so 2024/alpha.mbox comes before beta.mbox.
+    assert re.search(r"\[1/2\] unpacking 2024/alpha\.mbox -> alpha", err), err
+    assert re.search(r"\[2/2\] unpacking beta\.mbox -> beta", err), err
+
+
+def test_progress_line_shows_collision_suffix(tmp_path: Path, capsys) -> None:
+    """When two mboxes share a stem, the disambiguated target name is visible
+    in the [i/N] line so the user can tell which physical output dir it
+    landed in."""
+    from scripts.unpack_mbox_folder import main
+
+    src = tmp_path / "in"
+    (src / "a").mkdir(parents=True)
+    (src / "b").mkdir(parents=True)
+    _simple_mbox(src / "a" / "inbox.mbox")
+    _simple_mbox(src / "b" / "inbox.mbox")
+    out = tmp_path / "out"
+
+    rc = main([str(src), str(out)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    # First file keeps the plain name, second uses the -1 suffix; both must
+    # appear in their respective progress lines.
+    assert re.search(r"\[1/2\] unpacking a/inbox\.mbox -> inbox\b", err), err
+    assert re.search(r"\[2/2\] unpacking b/inbox\.mbox -> inbox-1\b", err), err
+
+
+def test_summary_includes_elapsed_seconds(tmp_path: Path, capsys) -> None:
+    from scripts.unpack_mbox_folder import main
+
+    src = tmp_path / "in"
+    src.mkdir()
+    _simple_mbox(src / "a.mbox")
+    out = tmp_path / "out"
+
+    rc = main([str(src), str(out)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    # Summary like: "Processed 1 mbox file(s) in 0.0s: 1 succeeded, 0 failed."
+    assert re.search(r"Processed 1 mbox file\(s\) in \d+\.\d+s:", err), err

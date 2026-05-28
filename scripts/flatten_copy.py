@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import time
 from pathlib import Path
 
 
@@ -39,16 +40,39 @@ def main(argv: list[str] | None = None) -> int:
 
     dst.mkdir(parents=True, exist_ok=True)
 
+    files = list(_iter_files(src))
+    print(
+        f"Found {len(files)} regular file(s) under {src}",
+        file=sys.stderr,
+    )
     used_names: set[str] = set()
     copied = 0
-    for src_file in _iter_files(src):
+    failed = 0
+    started = time.monotonic()
+
+    total = len(files)
+    for i, src_file in enumerate(files, start=1):
+        rel = src_file.relative_to(src)
         dst_name = _pick_dst_name(src_file.name, dst, used_names)
         used_names.add(dst_name)
-        shutil.copy2(src_file, dst / dst_name)
+        print(f"[{i}/{total}] copying {rel} -> {dst_name}", file=sys.stderr)
+        try:
+            shutil.copy2(src_file, dst / dst_name)
+        except Exception as exc:  # noqa: BLE001 — per-file isolation by design
+            failed += 1
+            print(
+                f"error: failed to copy {rel}: {exc}",
+                file=sys.stderr,
+            )
+            continue
         copied += 1
 
-    print(f"Copied {copied} file(s) into {dst}.", file=sys.stderr)
-    return 0
+    elapsed = time.monotonic() - started
+    print(
+        f"Copied {copied} file(s) into {dst} ({failed} failed) in {elapsed:.1f}s.",
+        file=sys.stderr,
+    )
+    return 0 if failed == 0 else 1
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

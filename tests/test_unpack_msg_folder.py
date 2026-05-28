@@ -9,6 +9,7 @@ in-place unit tests.
 
 from __future__ import annotations
 
+import re
 import time
 import os
 from pathlib import Path
@@ -170,3 +171,81 @@ def test_input_must_be_an_existing_directory(tmp_path: Path) -> None:
 
     rc = main([str(tmp_path / "nope"), str(tmp_path / "out")])
     assert rc != 0
+
+
+def test_prints_found_header_with_count(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from scripts.unpack_msg_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _drop_msg(src / "a.msg")
+    _drop_msg(src / "nested" / "b.msg")
+    _install_reader(monkeypatch, lambda p: _msg(subject="x", body="y"))
+
+    rc = main([str(src), str(dst)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert re.search(r"Found 2 msg file\(s\) under .*src", err), err
+
+
+def test_prints_per_item_progress_line(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from scripts.unpack_msg_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _drop_msg(src / "2024" / "alpha.msg")
+    _drop_msg(src / "beta.msg")
+    _install_reader(monkeypatch, lambda p: _msg(subject="x", body="y"))
+
+    rc = main([str(src), str(dst)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    # Sorted by relative path: 2024/alpha.msg comes before beta.msg.
+    assert re.search(r"\[1/2\] extracting 2024/alpha\.msg", err), err
+    assert re.search(r"\[2/2\] extracting beta\.msg", err), err
+
+
+def test_no_txt_produced_warns_with_relative_path(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The silent ``ensure_unpacked`` parse-failure branch (no .txt
+    written) must now log which file produced no output, with the path
+    relative to the input root."""
+    from scripts.unpack_msg_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _drop_msg(src / "deep" / "broken.msg")
+
+    def reader(p):
+        # ``read_message`` raising is the public contract of a parse failure.
+        raise ValueError("intentional test failure")
+    _install_reader(monkeypatch, reader)
+
+    rc = main([str(src), str(dst)])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert re.search(
+        r"warning: deep/broken\.msg: no \.txt produced",
+        err,
+    ), err
+
+
+def test_summary_includes_elapsed_seconds(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from scripts.unpack_msg_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _drop_msg(src / "a.msg")
+    _install_reader(monkeypatch, lambda p: _msg(subject="x", body="y"))
+
+    rc = main([str(src), str(dst)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert re.search(r"Processed 1 msg file\(s\) in \d+\.\d+s:", err), err
