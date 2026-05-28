@@ -579,17 +579,30 @@ def test_size_cap_disabled_indexes_everything(mock_get_model, tmp_path, monkeypa
 
 
 @patch("server.indexer.get_model")
-def test_index_folder_exempts_pst_from_size_cap(mock_get_model, tmp_path, monkeypatch):
-    """A .pst over the cap is indexed, not reported oversized — pypff streams
-    the archive. A non-streaming file of the same size is still skipped."""
+def test_index_folder_preprocesses_oversize_pst(mock_get_model, tmp_path, monkeypatch):
+    """A .pst over the size cap is still preprocessed — the cap only
+    applies to files flowing through extract_text, and .pst is now
+    handled by the preprocessing pass which doesn't read the archive
+    whole. The spawned .txt files (small) are indexed normally, and
+    the .pst itself is never seen by the size-cap check."""
+    from pst_handling.messages import ParsedPstMessage
+    from pst_handling import unpack as pst_unpack
+
     mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
     mock_get_model.return_value = mock_model
     monkeypatch.setattr("server.indexer.MAX_FILE_SIZE_BYTES", 1024)
-    # The fake .pst is not a real archive; parse it to a fixed part instead.
-    monkeypatch.setattr(
-        "server.parsers._extract_pst",
-        lambda path: [{"text": "a mail message about revenue", "metadata": {}}],
-    )
+
+    # Fake the .pst walker so we never need a real archive.
+    def fake_iter(_pst_path):
+        yield ParsedPstMessage(
+            folder_path="Top/Inbox",
+            subject="Quarterly review",
+            sender="alice",
+            date="2024-03-01 12:00:00+00:00",
+            body="Revenue grew 23% this quarter.",
+            attachments=(),
+        )
+    monkeypatch.setattr(pst_unpack, "iter_pst_messages", fake_iter)
 
     corpus = tmp_path / "corpus"
     corpus.mkdir()
@@ -598,11 +611,16 @@ def test_index_folder_exempts_pst_from_size_cap(mock_get_model, tmp_path, monkey
 
     result = index_folder(str(corpus), db_path=str(tmp_path / "db"))
 
-    assert result["files_indexed"] == 1       # the .pst was indexed
-    assert result["files_size_skipped"] == 1  # the .txt was skipped
+    # Spawned .txt from the unpacked .pst was indexed; the over-cap
+    # huge.txt was skipped; the .pst itself never reaches the size
+    # check because it's not in SUPPORTED_EXTENSIONS.
+    assert result["files_indexed"] >= 1
+    assert result["files_size_skipped"] == 1
     oversized = [o["file"] for o in result["oversized_files"]]
     assert any(f.endswith("huge.txt") for f in oversized)
-    assert not any(f.endswith("archive.pst") for f in oversized)
+    assert not any(f.endswith(".pst") for f in oversized)
+    # The spawned .txt for the mail message exists on disk.
+    assert any((corpus / "archive_unpacked").rglob("msg-*.txt"))
 
 
 # -- Tier 3: embedding device selection (item 4.10) --------------------------

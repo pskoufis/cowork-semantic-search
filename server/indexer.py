@@ -10,6 +10,7 @@ from typing import Callable
 
 from mbox_handling.unpack import ensure_unpacked as ensure_mbox_unpacked
 from msg_handling.unpack import ensure_unpacked as ensure_msg_unpacked
+from pst_handling.unpack import ensure_unpacked as ensure_pst_unpacked
 from server.parsers import extract_text, SUPPORTED_EXTENSIONS
 from server.chunker import chunk_document
 from server.exclusions import ExclusionRules
@@ -38,11 +39,13 @@ except ValueError:
 MAX_FILE_SIZE_BYTES = _MAX_FILE_SIZE_MB * 1024 * 1024 if _MAX_FILE_SIZE_MB > 0 else 0
 
 # Formats whose parser retains only a bounded preview, so the size cap above
-# must not apply. pypff reads a .pst incrementally; real Outlook archives are
-# routinely multi-GB. csv and xlsx/xlsm preview via streaming; xls loads the
-# whole BIFF document but is bounded by BIFF's 65,536-row-per-sheet cap. Only
+# must not apply. csv and xlsx/xlsm preview via streaming; xls loads the whole
+# BIFF document but is bounded by BIFF's 65,536-row-per-sheet cap. Only
 # headers + ~10 sample rows ever land in the preview regardless of file size.
-STREAMING_EXTENSIONS = {".pst", ".csv", ".xlsx", ".xlsm", ".xls"}
+# .pst is no longer here because it's preprocessed before discovery — the
+# pst_handling unpacker streams attachments directly to disk in 1 MB chunks
+# (see pst_handling.messages.ParsedPstAttachment.write_to).
+STREAMING_EXTENSIONS = {".csv", ".xlsx", ".xlsm", ".xls"}
 
 
 def exceeds_size_cap(file_path: Path, size: int) -> bool:
@@ -241,6 +244,51 @@ def _ensure_mboxes_unpacked(
                 )
 
 
+def _ensure_psts_unpacked(
+    folder: Path,
+    *,
+    recursive: bool,
+    exclusions: ExclusionRules | None,
+) -> None:
+    """Walk ``folder`` for ``*.pst`` files and ensure each has a fresh
+    sibling ``<stem>_unpacked/`` tree of per-message ``.txt`` files
+    before the main indexer walk runs.
+
+    Mirrors :func:`_ensure_mboxes_unpacked` — same recursive/exclusion
+    semantics, same per-file isolation (one broken .pst logs and is
+    skipped). Cannot reuse ``discover_files`` because ``.pst`` is not
+    in ``SUPPORTED_EXTENSIONS`` (the unpacked ``.txt`` files are what
+    gets indexed). Runs *before* the mbox / msg passes so .mbox or
+    .msg files inside a .pst's extracted attachments (rare but
+    possible) get unpacked by the subsequent passes.
+    """
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dpath = Path(dirpath)
+        if recursive:
+            if exclusions is not None:
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not exclusions.is_excluded(dpath / d, folder, is_dir=True)
+                ]
+        else:
+            dirnames[:] = []
+        for name in filenames:
+            if not name.lower().endswith(".pst"):
+                continue
+            pst_path = dpath / name
+            if exclusions is not None and exclusions.is_excluded(
+                pst_path, folder, is_dir=False
+            ):
+                continue
+            try:
+                ensure_pst_unpacked(pst_path)
+            except Exception as e:
+                print(
+                    f"warning: failed to unpack {pst_path}: {e}",
+                    file=sys.stderr,
+                )
+
+
 def _ensure_msgs_unpacked(
     folder: Path,
     *,
@@ -306,13 +354,19 @@ def index_folder(
     # any work is done. The MCP layer turns that into a `rejected` response.
     exclusions = ExclusionRules.load(folder, extra_patterns=exclude, db_dir=db_dir)
 
-    # Preprocessing pass: every .mbox under the corpus gets a fresh
-    # sibling <stem>_unpacked/ tree. The main walk then sees the .txt
-    # files (and materialized attachments) instead of the .mbox itself.
+    # Preprocessing pass: every .pst under the corpus gets a fresh
+    # sibling <stem>_unpacked/ tree of per-message .txt files mirroring
+    # the PST's folder hierarchy, with attachments materialized to
+    # disk. Runs first so any .mbox / .msg files inside a .pst's
+    # extracted attachments are caught by the subsequent passes.
+    _ensure_psts_unpacked(folder, recursive=recursive, exclusions=exclusions)
+    # Second pass: every .mbox under the corpus gets a fresh sibling
+    # <stem>_unpacked/ tree. The main walk then sees the .txt files
+    # (and materialized attachments) instead of the .mbox itself.
     _ensure_mboxes_unpacked(folder, recursive=recursive, exclusions=exclusions)
-    # Second preprocessing pass: every .msg under the corpus gets a fresh
-    # sibling <stem>.txt + attachments/<stem>__* layout. Runs after the
-    # mbox pass so .msg files surfaced inside an unpacked mbox tree (mbox
+    # Third pass: every .msg under the corpus gets a fresh sibling
+    # <stem>.txt + attachments/<stem>__* layout. Runs after the mbox
+    # pass so .msg files surfaced inside an unpacked mbox tree (mbox
     # messages can carry .msg attachments) are still caught.
     _ensure_msgs_unpacked(folder, recursive=recursive, exclusions=exclusions)
 
