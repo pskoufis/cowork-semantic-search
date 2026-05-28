@@ -103,7 +103,7 @@ def test_palette_image_converts(tmp_path: Path) -> None:
 # --- multi-frame handling ----------------------------------------------------
 
 
-def test_multipage_tiff_yields_single_page_pdf(tmp_path: Path) -> None:
+def test_multipage_tiff_yields_multipage_pdf(tmp_path: Path) -> None:
     from scripts import images_to_pdf as mod
 
     src, dst = tmp_path / "src", tmp_path / "dst"
@@ -113,7 +113,31 @@ def test_multipage_tiff_yields_single_page_pdf(tmp_path: Path) -> None:
 
     out = dst / "fax.pdf"
     assert out.is_file()
-    assert _pdf_page_count(out) == 1
+    # All three TIFF pages are preserved as PDF pages.
+    assert _pdf_page_count(out) == 3
+
+
+def test_single_frame_image_yields_single_page_pdf(tmp_path: Path) -> None:
+    from scripts import images_to_pdf as mod
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _make_image(src / "one.png", "RGB")
+
+    assert mod.main([str(src), str(dst)]) == 0
+    assert _pdf_page_count(dst / "one.pdf") == 1
+
+
+def test_animated_gif_yields_multipage_pdf(tmp_path: Path) -> None:
+    from scripts import images_to_pdf as mod
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    # Visually distinct frames so the GIF encoder doesn't merge them into one.
+    frames = [Image.new("RGB", (8, 8), (i * 60, 0, 0)) for i in range(4)]
+    frames[0].save(src / "anim.gif", "GIF", save_all=True, append_images=frames[1:])
+
+    assert mod.main([str(src), str(dst)]) == 0
+    assert _pdf_page_count(dst / "anim.pdf") == 4
 
 
 def test_heic_converts(tmp_path: Path) -> None:
