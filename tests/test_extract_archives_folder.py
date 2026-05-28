@@ -224,3 +224,69 @@ def test_msg_parse_failure_counts_as_failure(tmp_path, monkeypatch):
 
     assert rc == 1
     assert not (dst / "bad.txt").exists()
+
+
+# 9. --copy-others copies non-archive files into the mirrored output while
+#    archives are still extracted; without the flag they are left behind.
+def test_copy_others_mirrors_non_archive_files(tmp_path):
+    from scripts.extract_archives_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    (src / "docs").mkdir(parents=True)
+    (src / "docs" / "report.txt").write_text("hello report", encoding="utf-8")
+    (src / "top.pdf").write_bytes(b"%PDF-fake")
+    _write_zip(src / "a" / "bundle.zip", {"leaf.txt": b"in zip"})
+
+    rc = main([str(src), str(dst), "--copy-others"])
+
+    assert rc == 0
+    # Non-archive files copied, structure preserved.
+    assert (dst / "docs" / "report.txt").read_text(encoding="utf-8") == \
+        "hello report"
+    assert (dst / "top.pdf").read_bytes() == b"%PDF-fake"
+    # Archive still extracted (not merely copied).
+    assert (dst / "a" / "bundle" / "leaf.txt").read_bytes() == b"in zip"
+    # The archive original itself is NOT copied alongside its extraction.
+    assert not (dst / "a" / "bundle.zip").exists()
+
+
+def test_non_archive_files_not_copied_without_flag(tmp_path):
+    from scripts.extract_archives_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    (src / "docs").mkdir(parents=True)
+    (src / "docs" / "report.txt").write_text("hello", encoding="utf-8")
+
+    rc = main([str(src), str(dst)])
+
+    assert rc == 0
+    assert not (dst / "docs" / "report.txt").exists()
+
+
+# 10. re-run with --copy-others does not re-copy an up-to-date destination
+#     (overwrite only when the source is newer).
+def test_copy_others_skips_up_to_date_on_rerun(tmp_path, monkeypatch):
+    import scripts.extract_archives_folder as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    (src).mkdir()
+    (src / "report.txt").write_text("v1", encoding="utf-8")
+
+    assert mod.main([str(src), str(dst), "--copy-others"]) == 0
+    assert (dst / "report.txt").read_text(encoding="utf-8") == "v1"
+
+    # Second run: spy on the actual copy primitive — it must not fire again
+    # because the destination is already up to date (copy2 preserves mtime).
+    import shutil
+    calls: list[str] = []
+    real_copy2 = shutil.copy2
+    monkeypatch.setattr(
+        mod.shutil, "copy2",
+        lambda s, d, *a, **k: (calls.append(str(s)), real_copy2(s, d, *a, **k))[1],
+    )
+
+    assert mod.main([str(src), str(dst), "--copy-others"]) == 0
+    assert calls == []

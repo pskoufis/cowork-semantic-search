@@ -13,12 +13,20 @@ inside an extracted zip are processed too, until nothing new appears.
 ## CLI
 
 ```
-python scripts/extract_archives_folder.py <input-folder> <output-folder> [--dry-run] [--max-depth N]
+python scripts/extract_archives_folder.py <input-folder> <output-folder> \
+    [--dry-run] [--max-depth N] [--copy-others]
 ```
 
 - `input_folder`, `output_folder`: positional, like the sibling batch scripts.
 - `--dry-run`: print planned work, write nothing.
 - `--max-depth N`: recursion backstop (default 10).
+- `--copy-others`: also copy every **non-archive** file from the input tree
+  into the output, mirroring its layout — making the output a complete
+  index-ready mirror (extracted archives + all other docs). A single pass over
+  the *input* tree only (files revealed inside extracted zips already live in
+  the output). A destination is overwritten only when the source is newer
+  (mtime), so re-runs are idempotent. Archive originals are never copied — they
+  are extracted, not duplicated.
 
 ## Reuse, not reinvention
 
@@ -86,6 +94,10 @@ exit non-zero if any file failed. Matches existing batch-script convention.
    discriminator for the `.pst` branch — see caveat below).
 8. A `.msg` that fails to parse is counted as a failure, not a silent
    success (mirrors `unpack_msg_folder.py`'s guard).
+9. `--copy-others` mirrors non-archive files into the output while archives
+   are still extracted; without the flag they are left behind; archive
+   originals are not copied.
+10. A re-run with `--copy-others` does not re-copy an up-to-date destination.
 
 Per-type unpacking internals are already covered by existing tests.
 

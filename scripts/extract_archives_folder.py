@@ -33,6 +33,7 @@ Invariants:
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import time
 import zipfile
@@ -75,14 +76,25 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         dst.mkdir(parents=True, exist_ok=True)
 
-    return _run(src, dst, dry_run=args.dry_run, max_depth=args.max_depth)
+    return _run(src, dst, dry_run=args.dry_run, max_depth=args.max_depth,
+                copy_others=args.copy_others)
 
 
-def _run(src: Path, dst: Path, *, dry_run: bool, max_depth: int) -> int:
+def _run(src: Path, dst: Path, *, dry_run: bool, max_depth: int,
+         copy_others: bool = False) -> int:
     processed: set[Path] = set()
     counts = {"mbox": 0, "pst": 0, "msg": 0, "zip": 0}
     failed = 0
+    copied = 0
     started = time.monotonic()
+
+    # With --copy-others, mirror every non-archive file from the input tree
+    # into the output so the result is a complete index-ready mirror. Only
+    # the input tree is copied: files revealed inside extracted zips already
+    # live in the output tree.
+    if copy_others:
+        copied, copy_failed = _copy_other_files(src, dst, dry_run=dry_run)
+        failed += copy_failed
 
     # Pass 1 scans the input tree (target mirrors input). Every later pass
     # scans the output tree for archives revealed by a zip extraction and
@@ -125,10 +137,12 @@ def _run(src: Path, dst: Path, *, dry_run: bool, max_depth: int) -> int:
             )
 
     elapsed = time.monotonic() - started
+    copied_part = f" {copied} other file(s) copied;" if copy_others else ""
     print(
         f"Done in {elapsed:.1f}s: "
         f"{counts['zip']} zip, {counts['mbox']} mbox, "
-        f"{counts['pst']} pst, {counts['msg']} msg extracted; "
+        f"{counts['pst']} pst, {counts['msg']} msg extracted;"
+        f"{copied_part} "
         f"{failed} failed.",
         file=sys.stderr,
     )
@@ -205,6 +219,38 @@ def _extract_zip(zip_path: Path, target: Path) -> None:
                 outf.write(srcf.read())
 
 
+def _copy_other_files(src: Path, dst: Path, *, dry_run: bool) -> tuple[int, int]:
+    """Copy every non-archive file under ``src`` into ``dst`` preserving the
+    relative path. Archive types (handled by extraction) are skipped. A
+    destination is overwritten only when the source is newer (mtime), so
+    re-runs are idempotent. Returns ``(copied, failed)``.
+    """
+    copied = 0
+    failed = 0
+    for p in sorted(src.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() in _KINDS:
+            continue  # archives are extracted, not copied
+        rel = p.relative_to(src)
+        dest = dst / rel
+        if dest.exists() and p.stat().st_mtime <= dest.stat().st_mtime:
+            continue  # up to date — nothing to do
+        if dry_run:
+            print(f"copy: {rel}", file=sys.stderr)
+            copied += 1
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dest)
+        except Exception as exc:  # noqa: BLE001 — per-file isolation
+            failed += 1
+            print(f"error: failed to copy {p}: {exc}", file=sys.stderr)
+            continue
+        copied += 1
+    return copied, failed
+
+
 def _discover(root: Path) -> list[tuple[Path, str]]:
     """All .mbox/.pst/.msg/.zip files under ``root`` (recursive, by suffix),
     paired with their kind. Skips anything that is not a regular file (so an
@@ -250,6 +296,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Print planned extractions without writing anything.",
+    )
+    parser.add_argument(
+        "--copy-others", action="store_true",
+        help="Also copy every non-archive file from the input tree into the "
+             "output, mirroring its layout (overwriting only when the source "
+             "is newer). Makes the output a complete mirror of the input.",
     )
     parser.add_argument(
         "--max-depth", type=int, default=10,
