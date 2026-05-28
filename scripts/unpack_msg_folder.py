@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 # Allow ``python scripts/unpack_msg_folder.py`` (no ``-m``) by putting the
@@ -58,12 +59,20 @@ def main(argv: list[str] | None = None) -> int:
     dst.mkdir(parents=True, exist_ok=True)
 
     msgs = _discover_msgs(src)
+    print(
+        f"Found {len(msgs)} msg file(s) under {src}",
+        file=sys.stderr,
+    )
     succeeded = 0
     failed = 0
+    started = time.monotonic()
 
-    for msg_path in msgs:
+    total = len(msgs)
+    for i, msg_path in enumerate(msgs, start=1):
+        rel = msg_path.relative_to(src)
         rel_parent = msg_path.parent.relative_to(src)
         target_dir = dst / rel_parent
+        print(f"[{i}/{total}] extracting {rel}", file=sys.stderr)
         try:
             ensure_unpacked(msg_path, target=target_dir)
         except Exception as exc:  # noqa: BLE001 — per-file isolation by design
@@ -78,11 +87,17 @@ def main(argv: list[str] | None = None) -> int:
         # and summary, treat a missing ``.txt`` after a call as a failure.
         if not (target_dir / f"{msg_path.stem}.txt").exists():
             failed += 1
+            print(
+                f"warning: {rel}: no .txt produced "
+                "(parse failure; see prior msg_handling warning)",
+                file=sys.stderr,
+            )
             continue
         succeeded += 1
 
+    elapsed = time.monotonic() - started
     print(
-        f"Processed {len(msgs)} msg file(s): "
+        f"Processed {total} msg file(s) in {elapsed:.1f}s: "
         f"{succeeded} succeeded, {failed} failed.",
         file=sys.stderr,
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 
@@ -177,3 +178,101 @@ def test_preserves_mtime(tmp_path: Path) -> None:
     rc = main([str(src), str(dst)])
     assert rc == 0
     assert int((dst / "x.txt").stat().st_mtime) == target_ts
+
+
+def test_prints_found_header_with_count(tmp_path: Path, capsys) -> None:
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "a.txt", "A")
+    _write(src / "sub" / "b.txt", "B")
+
+    rc = main([str(src), str(dst)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert re.search(r"Found 2 regular file\(s\) under .*src", err), err
+
+
+def test_prints_per_item_progress_line(tmp_path: Path, capsys) -> None:
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "a.txt", "A")
+    _write(src / "sub" / "b.txt", "B")
+
+    rc = main([str(src), str(dst)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    # Sorted by relative path: a.txt comes before sub/b.txt.
+    assert re.search(r"\[1/2\] copying a\.txt -> a\.txt", err), err
+    assert re.search(r"\[2/2\] copying sub/b\.txt -> b\.txt", err), err
+
+
+def test_progress_line_shows_collision_rename(tmp_path: Path, capsys) -> None:
+    """When the destination name needs a `_1` suffix, the per-item line
+    surfaces the renamed target so the user can see what was written."""
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "a" / "file.pdf", "first")
+    _write(src / "b" / "file.pdf", "second")
+
+    rc = main([str(src), str(dst)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert re.search(r"\[1/2\] copying a/file\.pdf -> file\.pdf\b", err), err
+    assert re.search(r"\[2/2\] copying b/file\.pdf -> file_1\.pdf\b", err), err
+
+
+def test_per_file_failure_does_not_abort_batch(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A copy failure on one file must be logged with the path, the batch
+    must keep going, and the exit code must be non-zero."""
+    import shutil
+
+    from scripts import flatten_copy
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "good1.txt", "G1")
+    _write(src / "bad.txt", "BAD")
+    _write(src / "good2.txt", "G2")
+
+    real_copy2 = shutil.copy2
+
+    def flaky(srcp, dstp, *args, **kwargs):
+        if Path(srcp).name == "bad.txt":
+            raise OSError("intentional test failure")
+        return real_copy2(srcp, dstp, *args, **kwargs)
+
+    monkeypatch.setattr(flatten_copy.shutil, "copy2", flaky)
+
+    rc = flatten_copy.main([str(src), str(dst)])
+    assert rc != 0
+    # Healthy files still copied.
+    assert (dst / "good1.txt").read_text() == "G1"
+    assert (dst / "good2.txt").read_text() == "G2"
+    assert not (dst / "bad.txt").exists()
+    err = capsys.readouterr().err
+    assert "bad.txt" in err
+    assert "intentional test failure" in err
+    # Final summary distinguishes succeeded vs failed.
+    assert re.search(r"Copied 2 file\(s\) into .*dst \(1 failed\)", err), err
+
+
+def test_summary_includes_elapsed_seconds(tmp_path: Path, capsys) -> None:
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _write(src / "a.txt", "A")
+    dst = tmp_path / "dst"
+
+    rc = main([str(src), str(dst)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert re.search(r"Copied 1 file\(s\) into .*dst .*in \d+\.\d+s", err), err

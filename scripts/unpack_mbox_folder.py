@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 # Allow direct invocation (``python scripts/unpack_mbox_folder.py``) in
@@ -53,13 +54,23 @@ def main(argv: list[str] | None = None) -> int:
     dst.mkdir(parents=True, exist_ok=True)
 
     mboxes = _discover_mboxes(src)
+    print(
+        f"Found {len(mboxes)} mbox file(s) under {src}",
+        file=sys.stderr,
+    )
     succeeded = 0
     failed = 0
     used_names: set[str] = set()
+    started = time.monotonic()
 
-    for mbox in mboxes:
+    total = len(mboxes)
+    for i, mbox in enumerate(mboxes, start=1):
         target = _pick_target(dst, mbox.stem, used_names)
         used_names.add(target.name)
+        print(
+            f"[{i}/{total}] unpacking {mbox.relative_to(src)} -> {target.name}",
+            file=sys.stderr,
+        )
         try:
             ensure_unpacked(mbox, target=target)
         except Exception as exc:  # noqa: BLE001 — per-file isolation by design
@@ -71,8 +82,9 @@ def main(argv: list[str] | None = None) -> int:
             continue
         succeeded += 1
 
+    elapsed = time.monotonic() - started
     print(
-        f"Processed {len(mboxes)} mbox file(s): "
+        f"Processed {total} mbox file(s) in {elapsed:.1f}s: "
         f"{succeeded} succeeded, {failed} failed.",
         file=sys.stderr,
     )
