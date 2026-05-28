@@ -195,6 +195,9 @@ def test_target_for_conventions(tmp_path):
                        src=src, dst=dst) == dst / "a"
     assert _target_for(src / "a" / "x.zip", "zip", from_input=True,
                        src=src, dst=dst) == dst / "a" / "x"
+    # rar mirrors the zip convention: extract into <parent>/<stem>/.
+    assert _target_for(src / "a" / "x.rar", "rar", from_input=True,
+                       src=src, dst=dst) == dst / "a" / "x"
 
     # Discovered inside the output tree -> processed in place.
     g = dst / "a" / "bundle" / "y.pst"
@@ -202,6 +205,8 @@ def test_target_for_conventions(tmp_path):
         dst / "a" / "bundle" / "y_unpacked"
     assert _target_for(dst / "a" / "bundle" / "y.msg", "msg", from_input=False,
                        src=src, dst=dst) == dst / "a" / "bundle"
+    assert _target_for(dst / "a" / "bundle" / "y.rar", "rar", from_input=False,
+                       src=src, dst=dst) == dst / "a" / "bundle" / "y"
 
 
 # 8. a .msg that fails to parse (no .txt produced) is counted as a failure,
@@ -290,3 +295,76 @@ def test_copy_others_skips_up_to_date_on_rerun(tmp_path, monkeypatch):
 
     assert mod.main([str(src), str(dst), "--copy-others"]) == 0
     assert calls == []
+
+
+# 11. .rar is a recognised kind; _extract_rar gives a friendly install hint
+#     when the rarfile package is absent (it is absent in this env).
+def test_extract_rar_friendly_hint_without_rarfile(tmp_path):
+    import pytest
+    try:
+        import rarfile  # noqa: F401
+        pytest.skip("rarfile is installed; the no-package hint path can't run")
+    except ImportError:
+        pass
+
+    from scripts.extract_archives_folder import _extract_rar, _KINDS
+
+    assert _KINDS.get(".rar") == "rar"
+
+    with pytest.raises(Exception) as exc:
+        _extract_rar(tmp_path / "nope.rar", tmp_path / "out")
+    msg = str(exc.value).lower()
+    assert "rarfile" in msg and "pip install" in msg
+
+
+# 12. macOS metadata junk (AppleDouble ._*, .DS_Store, __MACOSX/) is never
+#     discovered as an archive — fixes the ._*.zip "not a zip" failures on
+#     exFAT drives.
+def test_discover_skips_macos_metadata(tmp_path):
+    from scripts.extract_archives_folder import _discover
+
+    (tmp_path / "real.zip").write_bytes(b"PK\x03\x04")
+    (tmp_path / "._real.zip").write_bytes(b"\x00\x05\x16\x07")  # AppleDouble
+    (tmp_path / ".DS_Store").write_bytes(b"\x00")
+    (tmp_path / "__MACOSX").mkdir()
+    (tmp_path / "__MACOSX" / "bar.zip").write_bytes(b"\x00")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "._nested.msg").write_bytes(b"\x00")
+
+    names = {p.name for p, _ in _discover(tmp_path)}
+    assert names == {"real.zip"}
+
+
+# 13. multi-volume rar sets: only the first volume is discovered; secondary
+#     .partN.rar (N>1) volumes are skipped (the first pulls in the whole set).
+def test_discover_skips_secondary_rar_volumes(tmp_path):
+    from scripts.extract_archives_folder import _discover
+
+    for name in ("a.part1.rar", "a.part2.rar", "a.part3.rar",
+                 "b.part01.rar", "b.part02.rar", "solo.rar"):
+        (tmp_path / name).write_bytes(b"Rar!\x1a\x07")
+
+    names = {p.name for p, _ in _discover(tmp_path)}
+    assert names == {"a.part1.rar", "b.part01.rar", "solo.rar"}
+
+
+# 14. --copy-others does not copy macOS metadata junk into the mirror.
+def test_copy_others_skips_macos_metadata(tmp_path):
+    from scripts.extract_archives_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "real.txt").write_text("keep me", encoding="utf-8")
+    (src / "._real.txt").write_bytes(b"\x00\x05\x16\x07")
+    (src / ".DS_Store").write_bytes(b"\x00")
+    (src / "__MACOSX").mkdir()
+    (src / "__MACOSX" / "junk.txt").write_text("nope", encoding="utf-8")
+
+    rc = main([str(src), str(dst), "--copy-others"])
+
+    assert rc == 0
+    assert (dst / "real.txt").read_text(encoding="utf-8") == "keep me"
+    assert not (dst / "._real.txt").exists()
+    assert not (dst / ".DS_Store").exists()
+    assert not (dst / "__MACOSX").exists()
