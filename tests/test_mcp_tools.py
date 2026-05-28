@@ -101,6 +101,99 @@ async def test_mcp_index_folder_runs_as_background_job(mock_model, docs_dir, tmp
 
 
 @pytest.mark.anyio
+async def test_mcp_index_folder_threads_unpack_first_param(
+    docs_dir, tmp_path, monkeypatch
+):
+    """The MCP tool's `unpack_first` argument must reach
+    server.indexer.index_folder as a keyword."""
+    seen: dict = {}
+
+    def spy(*args, **kwargs):
+        seen["unpack_first"] = (args[6] if len(args) > 6 else kwargs.get("unpack_first"))
+        # Return a minimal completed-result so the job doesn't blow up.
+        return {
+            "status": "completed",
+            "folder_path": args[0],
+            "files_indexed": 0,
+            "files_skipped": 0,
+            "files_deleted": 0,
+            "files_failed": 0,
+            "files_size_skipped": 0,
+            "files_excluded_pruned": 0,
+            "total_chunks": 0,
+            "errors": [],
+            "oversized_files": [],
+            "exclusion_patterns": [],
+            "descriptions_queued": 0,
+            "descriptions_sampled": 0,
+            "finalize_warnings": [],
+            "duration_seconds": 0.0,
+            "cancelled": False,
+        }
+
+    monkeypatch.setattr("server.indexer.index_folder", spy)
+
+    db_path = str(tmp_path / "db")
+    async with Client(mcp) as client:
+        start = await client.call_tool(
+            "index_folder",
+            {
+                "folder_path": str(docs_dir),
+                "db_path": db_path,
+                "unpack_first": False,
+            },
+        )
+        job_id = json.loads(start.content[0].text)["job_id"]
+        await _wait_for_job(client, db_path, job_id)
+
+    assert seen["unpack_first"] is False
+
+
+@pytest.mark.anyio
+async def test_mcp_index_folder_unpack_first_defaults_to_true(
+    docs_dir, tmp_path, monkeypatch
+):
+    """When unpack_first is omitted, it defaults to True — the historical
+    behavior the MCP tool has always had."""
+    seen: dict = {}
+
+    def spy(*args, **kwargs):
+        seen["unpack_first"] = (args[6] if len(args) > 6 else kwargs.get("unpack_first"))
+        return {
+            "status": "completed",
+            "folder_path": args[0],
+            "files_indexed": 0,
+            "files_skipped": 0,
+            "files_deleted": 0,
+            "files_failed": 0,
+            "files_size_skipped": 0,
+            "files_excluded_pruned": 0,
+            "total_chunks": 0,
+            "errors": [],
+            "oversized_files": [],
+            "exclusion_patterns": [],
+            "descriptions_queued": 0,
+            "descriptions_sampled": 0,
+            "finalize_warnings": [],
+            "duration_seconds": 0.0,
+            "cancelled": False,
+        }
+
+    monkeypatch.setattr("server.indexer.index_folder", spy)
+
+    db_path = str(tmp_path / "db")
+    async with Client(mcp) as client:
+        start = await client.call_tool(
+            "index_folder",
+            {"folder_path": str(docs_dir), "db_path": db_path},
+        )
+        job_id = json.loads(start.content[0].text)["job_id"]
+        await _wait_for_job(client, db_path, job_id)
+
+    assert seen["unpack_first"] is True
+
+
+@pytest.mark.anyio
 async def test_mcp_index_folder_job_fails_cleanly_on_error(docs_dir, tmp_path, monkeypatch):
     """An error raised inside the worker ends the job in 'failed', never hung."""
     def boom(*args, **kwargs):

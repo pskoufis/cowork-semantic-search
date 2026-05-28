@@ -8,7 +8,7 @@ to tests/test_pst_unpack.py alongside the unpacker they exercise.
 What remains here is the negative-dispatch contract: ``.pst`` must no
 longer be in ``SUPPORTED_EXTENSIONS`` and ``extract_text`` must refuse
 it, because PST is now handled by the preprocessing pass in
-``server.indexer._ensure_psts_unpacked`` rather than directly.
+``server.unpacker.run_unpack_passes`` rather than directly.
 """
 
 from pathlib import Path

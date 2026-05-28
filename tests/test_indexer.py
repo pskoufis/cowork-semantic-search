@@ -256,6 +256,79 @@ def test_index_folder_unpacks_mbox_then_indexes_txt_files(
 
 
 @patch("server.indexer.get_model")
+def test_index_folder_unpack_first_false_skips_preprocessing(
+    mock_get_model, tmp_path
+):
+    """With unpack_first=False, index_folder must NOT run the pst/mbox/msg
+    preprocessing passes. A .mbox that hasn't been pre-unpacked elsewhere
+    therefore yields no indexed .txt files."""
+    from tests.test_mbox_messages import _make_entry, _make_mbox
+
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _make_mbox(
+        corpus,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+        name="archive.mbox",
+    )
+
+    db_path = str(tmp_path / "testdb")
+    result = index_folder(str(corpus), db_path=db_path, unpack_first=False)
+
+    assert not (corpus / "archive_unpacked").exists(), (
+        "unpack_first=False must skip the preprocessing pass entirely — "
+        "no sibling _unpacked/ tree should appear."
+    )
+    indexed = VectorStore(db_path).get_all_files()
+    assert all(not f.endswith(".txt") or "_unpacked" not in f for f in indexed)
+    assert result["status"] == "completed"
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_unpack_first_false_uses_existing_unpacked_tree(
+    mock_get_model, tmp_path
+):
+    """When the unpacked tree was prepared by a separate `unpack` pass,
+    `index_folder(..., unpack_first=False)` picks up its .txt files via
+    the normal walk. This is the dev workflow the CLI's `csemsearch unpack`
+    + `csemsearch index --no-unpack` chain enables."""
+    from tests.test_mbox_messages import _make_entry, _make_mbox
+    from server.unpacker import run_unpack_passes
+
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _make_mbox(
+        corpus,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+        name="archive.mbox",
+    )
+
+    # Step 1: unpack out-of-band, like the CLI's `unpack` verb would.
+    run_unpack_passes(corpus)
+    assert (corpus / "archive_unpacked").is_dir()
+
+    # Step 2: index with unpack_first=False — the pre-unpacked .txt is picked up.
+    db_path = str(tmp_path / "testdb")
+    result = index_folder(str(corpus), db_path=db_path, unpack_first=False)
+
+    indexed = VectorStore(db_path).get_all_files()
+    assert any(f.endswith(".txt") and "_unpacked" in f for f in indexed)
+    assert result["files_indexed"] == 1
+
+
+@patch("server.indexer.get_model")
 def test_index_folder_handles_apostrophe_in_path(mock_get_model, tmp_path):
     """A file whose path contains a single quote is skip-detected on re-runs."""
     mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
@@ -832,3 +905,214 @@ def test_prune_works_when_folder_is_a_symlink(mock_get_model, tmp_path):
     (real / ".semanticignore").write_text("vendored/\n")
     r2 = index_folder(str(link), db_path=db_path)
     assert r2["files_excluded_pruned"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: ProgressEvent callback and cancel_event support
+#
+# The CLI needs richer progress info than the existing two-int callback
+# provides — at minimum the current file name (so a progress bar can show
+# what's churning) and a buffer-fill counter (so the user can see writes
+# happening even while the bar sits on one slow large file). It also needs
+# a way to interrupt a long-running indexing job cleanly via SIGINT, so the
+# buffer flushes before the process exits and the next re-run picks up at
+# the next unprocessed file.
+#
+# Both are added as new optional parameters alongside the existing
+# `progress_callback` — no breakage to existing callers.
+# ---------------------------------------------------------------------------
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_emits_progress_events_with_current_file(
+    mock_get_model, docs_dir, tmp_path
+):
+    """progress_event_callback receives a ProgressEvent dataclass with the
+    current file's name so the CLI bar can show what's being processed."""
+    from server.indexer import ProgressEvent
+
+    mock_model = type(
+        "MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)}
+    )()
+    mock_get_model.return_value = mock_model
+
+    events: list[ProgressEvent] = []
+
+    index_folder(
+        str(docs_dir),
+        db_path=str(tmp_path / "testdb"),
+        progress_event_callback=events.append,
+    )
+
+    assert events, "progress_event_callback was never invoked"
+    assert all(isinstance(e, ProgressEvent) for e in events)
+
+    per_file_events = [e for e in events if e.current_file is not None]
+    assert per_file_events, "expected at least one event with a current_file"
+    files_seen = {e.current_file for e in per_file_events}
+    expected = {"readme.md", "notes.txt", "bericht.md", "sub/deep.txt"}
+    # current_file is relative to the indexed root (cross-platform path).
+    seen_normalized = {p.replace("\\", "/").split("/", maxsplit=0)[0] or p for p in files_seen}
+    # On the final tick processed == total and current_file is None.
+    assert events[-1].current_file is None
+    assert events[-1].processed == events[-1].total == 4
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_progress_event_tracks_buffer_fill_and_chunks_written(
+    mock_get_model, docs_dir, tmp_path
+):
+    """ProgressEvent exposes the running chunk count and buffer fill so the
+    CLI can render a live writes-happening indicator even during long files."""
+    from server.indexer import ProgressEvent, FLUSH_CHUNK_THRESHOLD
+
+    mock_model = type(
+        "MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)}
+    )()
+    mock_get_model.return_value = mock_model
+
+    events: list[ProgressEvent] = []
+
+    index_folder(
+        str(docs_dir),
+        db_path=str(tmp_path / "testdb"),
+        progress_event_callback=events.append,
+    )
+
+    final = events[-1]
+    assert final.chunks_written > 0, (
+        "final event should report the total chunks committed to the store"
+    )
+    # buffer_fill is monotonically non-decreasing within a flush window and
+    # drops back to 0 after a flush — at the very last tick, the post-loop
+    # flush has emptied it.
+    assert final.buffer_fill == 0
+    # flush_threshold is surfaced verbatim so the CLI can show the ratio.
+    assert final.flush_threshold == FLUSH_CHUNK_THRESHOLD
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_old_progress_callback_still_works(
+    mock_get_model, docs_dir, tmp_path
+):
+    """The existing two-int progress_callback signature must keep working
+    untouched — the MCP server's _run_index_job relies on it, and so do
+    older external callers."""
+    mock_model = type(
+        "MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)}
+    )()
+    mock_get_model.return_value = mock_model
+
+    calls: list[tuple[int, int]] = []
+    index_folder(
+        str(docs_dir),
+        db_path=str(tmp_path / "testdb"),
+        progress_callback=lambda done, total: calls.append((done, total)),
+    )
+    assert calls and calls[-1] == (4, 4)
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_cancel_event_stops_loop_at_next_boundary(
+    mock_get_model, docs_dir, tmp_path
+):
+    """When cancel_event is set, index_folder breaks out of the main loop
+    at the next file boundary, flushes the chunk buffer, and returns a
+    result dict with cancelled=True. Files already processed remain in
+    the index so the next re-run skips them."""
+    import threading
+
+    from server.indexer import ProgressEvent
+
+    mock_model = type(
+        "MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)}
+    )()
+    mock_get_model.return_value = mock_model
+
+    cancel = threading.Event()
+    seen_files: list[str | None] = []
+
+    def cb(event: ProgressEvent) -> None:
+        seen_files.append(event.current_file)
+        # Set the cancel event after the first file is reported — the
+        # loop should break out before processing the second.
+        if event.current_file is not None and not cancel.is_set():
+            cancel.set()
+
+    captured_events: list[ProgressEvent] = []
+    seen_files.clear()
+
+    def cb_capturing(event: ProgressEvent) -> None:
+        captured_events.append(event)
+        seen_files.append(event.current_file)
+        if event.current_file is not None and not cancel.is_set():
+            cancel.set()
+
+    result = index_folder(
+        str(docs_dir),
+        db_path=str(tmp_path / "testdb"),
+        progress_event_callback=cb_capturing,
+        cancel_event=cancel,
+    )
+
+    assert result.get("cancelled") is True
+    assert result["status"] == "cancelled"
+    # At least one file got indexed before the cancel landed. The rest
+    # didn't. A re-run will pick them up.
+    assert 1 <= result["files_indexed"] < 4
+
+    # The final ProgressEvent must sit at the truncation point, NOT at
+    # processed == total. Otherwise a CLI bar driven by these events would
+    # paint a misleading "100% complete" right before the cancellation
+    # summary prints.
+    final = captured_events[-1]
+    assert final.current_file is None, "final tick still has current_file=None"
+    assert final.processed < final.total, (
+        f"final tick reported {final.processed}/{final.total} on cancel; "
+        "expected processed < total so the bar freezes mid-run."
+    )
+    assert final.processed == result["files_indexed"], (
+        "final tick's processed count must match files_indexed so the "
+        "summary line and bar agree."
+    )
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_cancel_event_persists_completed_work(
+    mock_get_model, docs_dir, tmp_path
+):
+    """After a cancelled run, the next run skips files that completed
+    before the cancellation — the file_index was persisted via a buffer
+    flush, not lost. Total work across the two runs equals one clean run."""
+    import threading
+
+    from server.indexer import ProgressEvent
+
+    mock_model = type(
+        "MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)}
+    )()
+    mock_get_model.return_value = mock_model
+
+    db = str(tmp_path / "testdb")
+    cancel = threading.Event()
+
+    def cb(event: ProgressEvent) -> None:
+        if event.current_file is not None and not cancel.is_set():
+            cancel.set()
+
+    r1 = index_folder(
+        str(docs_dir),
+        db_path=db,
+        progress_event_callback=cb,
+        cancel_event=cancel,
+    )
+    assert r1.get("cancelled") is True
+    indexed_first = r1["files_indexed"]
+
+    # Second run, no cancel — picks up where the first left off.
+    r2 = index_folder(str(docs_dir), db_path=db)
+    indexed_second = r2["files_indexed"]
+    skipped_second = r2["files_skipped"]
+
+    assert indexed_first + indexed_second == 4
+    assert skipped_second == indexed_first

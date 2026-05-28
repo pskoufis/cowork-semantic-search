@@ -25,7 +25,9 @@ def _human_size(num_bytes: int) -> str:
         size /= 1024
 
 
-async def _run_index_job(job, file_types, recursive, exclude, ctx=None) -> None:
+async def _run_index_job(
+    job, file_types, recursive, exclude, ctx=None, unpack_first: bool = True
+) -> None:
     """Run the synchronous index_folder in a worker thread, recording progress
     and the final outcome on the job record.
 
@@ -52,6 +54,7 @@ async def _run_index_job(job, file_types, recursive, exclude, ctx=None) -> None:
             job.db_path,
             progress,
             exclude,
+            unpack_first,
         )
         if ctx is not None and result.get("descriptions_queued", 0) > 0:
             sampled = await _auto_drain_descriptions(job.db_path, ctx)
@@ -107,6 +110,19 @@ async def index_folder(
             default=None,
         ),
     ] = None,
+    unpack_first: Annotated[
+        bool,
+        Field(
+            description="Whether to run the pst/mbox/msg preprocessing pass "
+                        "before indexing. Default True — set to False only "
+                        "when the unpacked sibling directories were prepared "
+                        "ahead of time (e.g. via `csemsearch unpack` or a "
+                        "batch unpack script). Skipping the pass when archives "
+                        "have changed since the last unpack leads to stale "
+                        "indexed content.",
+            default=True,
+        ),
+    ] = True,
     ctx: Context = None,
 ) -> dict:
     """Start a background job to index or re-index all documents in a folder.
@@ -184,7 +200,9 @@ async def index_folder(
 
     job = registry.create(folder_path, db_dir)
     job.task = asyncio.create_task(
-        _run_index_job(job, file_types, recursive, exclude, ctx=ctx)
+        _run_index_job(
+            job, file_types, recursive, exclude, ctx=ctx, unpack_first=unpack_first
+        )
     )
     return {
         "status": "started",
@@ -383,120 +401,20 @@ def reindex_file(
     self-protection — a file inside the active index directory is rejected
     with `reason: 'inside_index_dir'`.
     """
-    from server.jobs import registry
+    from server.indexer import reindex_one_file
 
-    if registry.has_running():
-        active = registry.active()
-        return {
-            "status": "rejected",
-            "message": "An indexing job is running; retry reindex_file once it finishes.",
-            "running_job_id": active[0].job_id if active else None,
-        }
-
-    from pathlib import Path
-    from server.parsers import extract_text
-    from server.chunker import chunk_document
-    from server.indexer import (
-        embed_chunks, compute_file_hash, MAX_FILE_SIZE_BYTES, exceeds_size_cap,
-    )
-    from server.store import VectorStore
-    from server.paths import to_relative
-
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    if db_path is None:
-        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
-    db_dir = os.path.abspath(db_path)
-
-    # Hard rule: a path inside the active LanceDB directory is never indexed —
-    # otherwise a stray call could try to parse the index's own files.
-    try:
-        resolved = path.resolve()
-    except OSError:
-        resolved = path
-    db_resolved = Path(db_dir).resolve() if Path(db_dir).exists() else Path(db_dir)
-    if resolved.is_relative_to(db_resolved):
-        return {
-            "status": "rejected",
-            "reason": "inside_index_dir",
-            "file_path": file_path,
-            "message": (
-                "file_path is inside the active LanceDB directory; "
-                "reindex_file refuses to parse the index's own files."
-            ),
-        }
-
-    stat = path.stat()
-    if exceeds_size_cap(path, stat.st_size):
-        # Too large to parse without risking an OOM; leave the index untouched.
-        # Streaming formats (.pst) are exempt from the cap.
-        return {
-            "status": "skipped",
-            "file_path": file_path,
-            "reason": (
-                f"file is {stat.st_size / 1024 / 1024:.1f} MB, over the "
-                f"{MAX_FILE_SIZE_BYTES // 1024 // 1024} MB indexing cap "
-                f"(set via the MAX_FILE_SIZE_MB env var)"
-            ),
-            "chunks_created": 0,
-        }
-
-    source_rel = to_relative(str(path), db_dir)
-
-    store = VectorStore(db_dir)
-    store.ensure_schema()  # migrate an older index in place, if needed
-    store.delete_by_file(source_rel)
-
-    # Spreadsheet path: extract a preview, enqueue, and return. Description
-    # chunks land when the host LLM submits via submit_description (or when
-    # ctx.sample drains the queue — but reindex_file has no ctx).
-    from server.spreadsheets import (
-        SPREADSHEET_EXTENSIONS, UnreadableSpreadsheetError,
-        extract_preview, needs_for_preview,
-    )
-    import json as _json
-    if path.suffix.lower() in SPREADSHEET_EXTENSIONS:
-        try:
-            preview = extract_preview(path)
-        except UnreadableSpreadsheetError as exc:
-            return {
-                "status": "failed",
-                "file_path": file_path,
-                "reason": f"unreadable spreadsheet: {exc}",
-            }
-        file_hash = compute_file_hash(path)
-        needs = needs_for_preview(preview)
-        store.enqueue_pending(
-            file_path=source_rel,
-            needs=needs,
-            preview_json=_json.dumps(preview),
-            content_hash=file_hash,
+    result = reindex_one_file(file_path, db_path)
+    # Preserve the MCP tool's pre-extraction wording for the running-job
+    # rejection — clients may match on this string.
+    if (
+        result.get("status") == "rejected"
+        and result.get("message")
+        and "retry once it finishes" in result["message"]
+    ):
+        result["message"] = (
+            "An indexing job is running; retry reindex_file once it finishes."
         )
-        return {
-            "status": "queued",
-            "file_path": file_path,
-            "needs": needs,
-        }
-
-    parts = extract_text(path)
-    chunks = chunk_document(parts, source_rel)
-    file_hash = compute_file_hash(path)
-
-    if chunks:
-        chunks = embed_chunks(chunks)
-        for c in chunks:
-            c["content_hash"] = file_hash
-            c["mtime_ns"] = stat.st_mtime_ns
-            c["file_size"] = stat.st_size
-        store.add_chunks(chunks)
-
-    return {
-        "status": "reindexed",
-        "file_path": file_path,
-        "chunks_created": len(chunks),
-    }
+    return result
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
