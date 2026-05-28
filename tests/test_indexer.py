@@ -256,6 +256,79 @@ def test_index_folder_unpacks_mbox_then_indexes_txt_files(
 
 
 @patch("server.indexer.get_model")
+def test_index_folder_unpack_first_false_skips_preprocessing(
+    mock_get_model, tmp_path
+):
+    """With unpack_first=False, index_folder must NOT run the pst/mbox/msg
+    preprocessing passes. A .mbox that hasn't been pre-unpacked elsewhere
+    therefore yields no indexed .txt files."""
+    from tests.test_mbox_messages import _make_entry, _make_mbox
+
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _make_mbox(
+        corpus,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+        name="archive.mbox",
+    )
+
+    db_path = str(tmp_path / "testdb")
+    result = index_folder(str(corpus), db_path=db_path, unpack_first=False)
+
+    assert not (corpus / "archive_unpacked").exists(), (
+        "unpack_first=False must skip the preprocessing pass entirely — "
+        "no sibling _unpacked/ tree should appear."
+    )
+    indexed = VectorStore(db_path).get_all_files()
+    assert all(not f.endswith(".txt") or "_unpacked" not in f for f in indexed)
+    assert result["status"] == "completed"
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_unpack_first_false_uses_existing_unpacked_tree(
+    mock_get_model, tmp_path
+):
+    """When the unpacked tree was prepared by a separate `unpack` pass,
+    `index_folder(..., unpack_first=False)` picks up its .txt files via
+    the normal walk. This is the dev workflow the CLI's `csemsearch unpack`
+    + `csemsearch index --no-unpack` chain enables."""
+    from tests.test_mbox_messages import _make_entry, _make_mbox
+    from server.unpacker import run_unpack_passes
+
+    mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _make_mbox(
+        corpus,
+        _make_entry(
+            {"From": "a@x", "Subject": "one", "Message-ID": "<m@x>"},
+            "body",
+        ),
+        name="archive.mbox",
+    )
+
+    # Step 1: unpack out-of-band, like the CLI's `unpack` verb would.
+    run_unpack_passes(corpus)
+    assert (corpus / "archive_unpacked").is_dir()
+
+    # Step 2: index with unpack_first=False — the pre-unpacked .txt is picked up.
+    db_path = str(tmp_path / "testdb")
+    result = index_folder(str(corpus), db_path=db_path, unpack_first=False)
+
+    indexed = VectorStore(db_path).get_all_files()
+    assert any(f.endswith(".txt") and "_unpacked" in f for f in indexed)
+    assert result["files_indexed"] == 1
+
+
+@patch("server.indexer.get_model")
 def test_index_folder_handles_apostrophe_in_path(mock_get_model, tmp_path):
     """A file whose path contains a single quote is skip-detected on re-runs."""
     mock_model = type("MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed(texts)})()

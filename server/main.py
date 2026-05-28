@@ -25,7 +25,9 @@ def _human_size(num_bytes: int) -> str:
         size /= 1024
 
 
-async def _run_index_job(job, file_types, recursive, exclude, ctx=None) -> None:
+async def _run_index_job(
+    job, file_types, recursive, exclude, ctx=None, unpack_first: bool = True
+) -> None:
     """Run the synchronous index_folder in a worker thread, recording progress
     and the final outcome on the job record.
 
@@ -52,6 +54,7 @@ async def _run_index_job(job, file_types, recursive, exclude, ctx=None) -> None:
             job.db_path,
             progress,
             exclude,
+            unpack_first,
         )
         if ctx is not None and result.get("descriptions_queued", 0) > 0:
             sampled = await _auto_drain_descriptions(job.db_path, ctx)
@@ -107,6 +110,19 @@ async def index_folder(
             default=None,
         ),
     ] = None,
+    unpack_first: Annotated[
+        bool,
+        Field(
+            description="Whether to run the pst/mbox/msg preprocessing pass "
+                        "before indexing. Default True — set to False only "
+                        "when the unpacked sibling directories were prepared "
+                        "ahead of time (e.g. via `csemsearch unpack` or a "
+                        "batch unpack script). Skipping the pass when archives "
+                        "have changed since the last unpack leads to stale "
+                        "indexed content.",
+            default=True,
+        ),
+    ] = True,
     ctx: Context = None,
 ) -> dict:
     """Start a background job to index or re-index all documents in a folder.
@@ -184,7 +200,9 @@ async def index_folder(
 
     job = registry.create(folder_path, db_dir)
     job.task = asyncio.create_task(
-        _run_index_job(job, file_types, recursive, exclude, ctx=ctx)
+        _run_index_job(
+            job, file_types, recursive, exclude, ctx=ctx, unpack_first=unpack_first
+        )
     )
     return {
         "status": "started",
