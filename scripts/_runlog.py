@@ -68,10 +68,12 @@ def _now_iso() -> str:
 
 
 def _new_run_id() -> str:
-    # Timestamp for chronological sort + a short random suffix so two runs in
-    # the same second never collide on the filename (which would merge their
-    # records into one file).
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # Microsecond-precision timestamp so filename sort is reliably
+    # chronological (the ledger's "latest record wins" depends on this), plus
+    # a short random suffix so two runs in the same microsecond still land in
+    # distinct files rather than merging their records.
+    now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y%m%dT%H%M%S") + f"{now.microsecond:06d}Z"
     return f"{stamp}-{uuid.uuid4().hex[:6]}"
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -11,6 +12,24 @@ def _write(p: Path, content: str = "x") -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
     return p
+
+
+def _runlog_items(dst: Path) -> list[dict]:
+    """Item records from the most recent flatten_copy run-log under ``dst``."""
+    logs = sorted((dst / "_runlogs").glob("flatten_copy-*.jsonl"))
+    assert logs, "no run-log written"
+    items = []
+    for line in logs[-1].read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        if rec["event"] == "item":
+            items.append(rec)
+    return items
+
+
+def _files_only(d: Path) -> dict[str, str]:
+    """Map of filename -> content for regular files directly under ``d``
+    (ignores the _runlogs/ directory)."""
+    return {p.name: p.read_text() for p in d.iterdir() if p.is_file()}
 
 
 def test_flat_copy_of_top_level_files(tmp_path: Path) -> None:
@@ -41,8 +60,8 @@ def test_recursive_walk_flattens_subdirs(tmp_path: Path) -> None:
     assert (dst / "top.txt").read_text() == "T"
     assert (dst / "deep.txt").read_text() == "D"
     assert (dst / "deeper.txt").read_text() == "DD"
-    # No subdirs should exist in the destination.
-    assert not any(p.is_dir() for p in dst.iterdir())
+    # No subdirs should exist in the destination (the run-log sidecar aside).
+    assert not any(p.is_dir() for p in dst.iterdir() if p.name != "_runlogs")
 
 
 def test_name_collision_uses_underscore_suffix(tmp_path: Path) -> None:
@@ -56,7 +75,7 @@ def test_name_collision_uses_underscore_suffix(tmp_path: Path) -> None:
 
     rc = main([str(src), str(dst)])
     assert rc == 0
-    contents = sorted((p.name, p.read_text()) for p in dst.iterdir())
+    contents = sorted((p.name, p.read_text()) for p in dst.iterdir() if p.is_file())
     names = [n for n, _ in contents]
     assert "file.pdf" in names
     assert "file_1.pdf" in names
@@ -75,7 +94,7 @@ def test_collision_on_file_without_extension(tmp_path: Path) -> None:
 
     rc = main([str(src), str(dst)])
     assert rc == 0
-    names = sorted(p.name for p in dst.iterdir())
+    names = sorted(p.name for p in dst.iterdir() if p.is_file())
     assert names == ["README", "README_1"]
 
 
@@ -276,3 +295,126 @@ def test_summary_includes_elapsed_seconds(tmp_path: Path, capsys) -> None:
     assert rc == 0
     err = capsys.readouterr().err
     assert re.search(r"Copied 1 file\(s\) into .*dst .*in \d+\.\d+s", err), err
+
+
+# -- run-log + idempotent re-run -----------------------------------------
+
+
+def test_runlog_records_successful_copies(tmp_path: Path) -> None:
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "a.txt", "A")
+    _write(src / "sub" / "b.txt", "B")
+
+    assert main([str(src), str(dst)]) == 0
+    items = _runlog_items(dst)
+    by_input = {it["input"]: it for it in items}
+    assert by_input["a.txt"]["status"] == "ok"
+    assert by_input["sub/b.txt"]["status"] == "ok"
+    # Output paths are recorded so the ledger can map input -> output.
+    assert by_input["a.txt"]["output"].endswith("a.txt")
+
+
+def test_rerun_is_idempotent_no_duplicates(tmp_path: Path, capsys) -> None:
+    """A second run over the same input must skip everything — no `_1`/`_2`
+    duplicates, output tree unchanged."""
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "a.txt", "A")
+    _write(src / "sub" / "b.txt", "B")
+
+    assert main([str(src), str(dst)]) == 0
+    capsys.readouterr()
+    before = _files_only(dst)
+
+    assert main([str(src), str(dst)]) == 0
+    err = capsys.readouterr().err
+    after = _files_only(dst)
+
+    assert after == before  # no new files, no duplicates
+    assert "skip" in err.lower()
+    items = _runlog_items(dst)
+    assert {it["status"] for it in items} == {"skip"}
+
+
+def test_collision_between_distinct_inputs_still_renamed_on_first_run(
+    tmp_path: Path,
+) -> None:
+    """Idempotency must not break genuine same-name collisions between two
+    *different* inputs in a single run — they still get `_1`."""
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "a" / "file.pdf", "first")
+    _write(src / "b" / "file.pdf", "second")
+
+    assert main([str(src), str(dst)]) == 0
+    names = sorted(_files_only(dst))
+    assert names == ["file.pdf", "file_1.pdf"]
+
+
+def test_retry_after_fix_reprocesses_only_failed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Run 1: one file fails. Fix the cause, re-run the same command — only the
+    previously-failed file is copied; the rest are skipped."""
+    import shutil
+
+    from scripts import flatten_copy
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "good1.txt", "G1")
+    _write(src / "bad.txt", "BAD")
+    _write(src / "good2.txt", "G2")
+
+    real_copy2 = shutil.copy2
+
+    def flaky(srcp, dstp, *args, **kwargs):
+        if Path(srcp).name == "bad.txt":
+            raise OSError("intentional test failure")
+        return real_copy2(srcp, dstp, *args, **kwargs)
+
+    monkeypatch.setattr(flatten_copy.shutil, "copy2", flaky)
+    assert flatten_copy.main([str(src), str(dst)]) != 0
+    assert not (dst / "bad.txt").exists()
+    capsys.readouterr()
+
+    # "Fix" the cause: restore real copy2 and re-run.
+    monkeypatch.setattr(flatten_copy.shutil, "copy2", real_copy2)
+    assert flatten_copy.main([str(src), str(dst)]) == 0
+
+    assert (dst / "bad.txt").read_text() == "BAD"
+    by_input = {it["input"]: it["status"] for it in _runlog_items(dst)}
+    assert by_input["bad.txt"] == "ok"
+    assert by_input["good1.txt"] == "skip"
+    assert by_input["good2.txt"] == "skip"
+
+
+def test_force_reprocesses_everything(tmp_path: Path) -> None:
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "a.txt", "A")
+
+    assert main([str(src), str(dst)]) == 0
+    assert main([str(src), str(dst), "--force"]) == 0
+    # With --force the second run re-copies rather than skipping.
+    assert {it["status"] for it in _runlog_items(dst)} == {"ok"}
+
+
+def test_no_runlog_flag_writes_no_log(tmp_path: Path) -> None:
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "a.txt", "A")
+
+    assert main([str(src), str(dst), "--no-runlog"]) == 0
+    assert not (dst / "_runlogs").exists()
