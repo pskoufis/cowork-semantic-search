@@ -2,12 +2,19 @@
 
 Usage:
     python scripts/flatten_copy.py <source-folder> <target-folder>
+        [--exclude-ext .ics] [--exclude-ext .tmp,.bak]
 
 Walks ``<source-folder>`` recursively and copies every regular file
 (symlinks skipped) into ``<target-folder>`` with no subdirectory
 structure. Name collisions are resolved by appending ``_1``, ``_2``, ...
 to the stem (e.g. ``foo.pdf`` → ``foo_1.pdf``); the first occurrence
 keeps the plain name.
+
+``--exclude-ext`` skips files by extension (case-insensitive, matched on
+the last suffix). It is repeatable and accepts comma-separated lists; a
+leading dot is optional (``ics`` and ``.ics`` are equivalent). Excluded
+files are filtered out before copying, so they are neither counted nor
+recorded in the run-log.
 """
 
 from __future__ import annotations
@@ -51,7 +58,14 @@ def main(argv: list[str] | None = None) -> int:
 
     dst.mkdir(parents=True, exist_ok=True)
 
-    files = list(_iter_files(src))
+    exclude_exts = _normalize_exts(args.exclude_ext)
+    if exclude_exts:
+        print(
+            f"Excluding extensions: {', '.join(sorted(exclude_exts))}",
+            file=sys.stderr,
+        )
+
+    files = list(_iter_files(src, exclude_exts))
     print(
         f"Found {len(files)} regular file(s) under {src}",
         file=sys.stderr,
@@ -141,19 +155,49 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("source_folder", help="Folder to copy files from")
     parser.add_argument("target_folder", help="Folder to copy files into (flat)")
+    parser.add_argument(
+        "--exclude-ext",
+        action="append",
+        default=None,
+        metavar="EXT[,EXT...]",
+        help=(
+            "Extension(s) to skip, case-insensitive (e.g. .ics). Repeatable "
+            "and comma-separated; a leading dot is optional."
+        ),
+    )
     _runlog.add_args(parser)
     return parser.parse_args(argv)
 
 
-def _iter_files(root: Path):
+def _normalize_exts(values: list[str] | None) -> set[str]:
+    """Turn ``--exclude-ext`` values into a set of lowercase, dot-prefixed
+    extensions. Handles repeated flags and comma-separated lists; ``ics`` and
+    ``.ics`` are equivalent; blanks are dropped."""
+    exts: set[str] = set()
+    for value in values or []:
+        for part in value.split(","):
+            part = part.strip().lower()
+            if not part:
+                continue
+            if not part.startswith("."):
+                part = "." + part
+            exts.add(part)
+    return exts
+
+
+def _iter_files(root: Path, exclude_exts: set[str] | None = None):
     """Yield regular files under ``root`` (recursive). Symlinks are skipped
-    to avoid loops and dangling targets. Sort by relative path for
+    to avoid loops and dangling targets. Files whose last suffix is in
+    ``exclude_exts`` (case-insensitive) are omitted. Sort by relative path for
     deterministic collision order."""
+    exclude_exts = exclude_exts or set()
     found: list[Path] = []
     for path in root.rglob("*"):
         if path.is_symlink():
             continue
         if path.is_file():
+            if path.suffix.lower() in exclude_exts:
+                continue
             found.append(path)
     found.sort(key=lambda p: str(p.relative_to(root)))
     yield from found
