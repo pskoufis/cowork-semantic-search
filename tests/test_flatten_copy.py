@@ -437,3 +437,81 @@ def test_no_runlog_flag_writes_no_log(tmp_path: Path) -> None:
 
     assert main([str(src), str(dst), "--no-runlog"]) == 0
     assert not (dst / "_runlogs").exists()
+
+
+# -- over-long filenames (filesystem 255-byte per-component limit) --------
+#
+# These exercise _pick_dst_name directly rather than via a long-named *source*
+# file: the dev/CI filesystem (APFS, ext4) refuses to *create* a 300-byte name
+# at all (ENAMETOOLONG), so a real over-long source fixture is impossible. The
+# crash in the field came from copying such a name (read off a more permissive
+# volume) into a destination that does enforce the limit — which is exactly the
+# destination-side name picking these tests cover.
+
+
+def test_pick_dst_name_truncates_overlong_and_is_creatable(tmp_path: Path) -> None:
+    from scripts.flatten_copy import _pick_dst_name
+
+    name = ("x" * 300) + ".pdf"
+    picked = _pick_dst_name(name, tmp_path, set())
+    assert picked.endswith(".pdf")  # real extension preserved
+    assert len(picked.encode("utf-8")) <= 255
+    # The whole point: the returned name can actually be created and stat'd on
+    # this filesystem without ENAMETOOLONG (the original crash site).
+    out = tmp_path / picked
+    out.write_text("data")
+    assert out.exists() and out.read_text() == "data"
+
+
+def test_pick_dst_name_overlong_names_collide_distinctly(tmp_path: Path) -> None:
+    from scripts.flatten_copy import _pick_dst_name
+
+    name = ("y" * 300) + ".pdf"
+    used: set[str] = set()
+    first = _pick_dst_name(name, tmp_path, used)
+    used.add(first)
+    (tmp_path / first).write_text("1")
+    second = _pick_dst_name(name, tmp_path, used)
+    assert first != second
+    assert first.endswith(".pdf") and second.endswith(".pdf")
+    assert all(len(n.encode("utf-8")) <= 255 for n in (first, second))
+
+
+def test_pick_dst_name_overlong_with_no_extension(tmp_path: Path) -> None:
+    from scripts.flatten_copy import _pick_dst_name
+
+    picked = _pick_dst_name("z" * 300, tmp_path, set())
+    assert len(picked.encode("utf-8")) <= 255
+    (tmp_path / picked).write_text("ok")  # creatable
+
+
+def test_name_pick_failure_does_not_abort_batch(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A failure while *choosing* the destination name (not just during the
+    copy) must isolate to that one file, not abort the whole run. Guards the
+    fix that moved name selection inside the per-item try/except."""
+    from scripts import flatten_copy
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "good1.txt", "G1")
+    _write(src / "bad.txt", "BAD")
+    _write(src / "good2.txt", "G2")
+
+    real_pick = flatten_copy._pick_dst_name
+
+    def flaky_pick(name, dest, used):
+        if name == "bad.txt":
+            raise OSError("intentional name-pick failure")
+        return real_pick(name, dest, used)
+
+    monkeypatch.setattr(flatten_copy, "_pick_dst_name", flaky_pick)
+
+    rc = flatten_copy.main([str(src), str(dst)])
+    assert rc != 0
+    assert (dst / "good1.txt").read_text() == "G1"
+    assert (dst / "good2.txt").read_text() == "G2"
+    assert not (dst / "bad.txt").exists()
+    err = capsys.readouterr().err
+    assert "bad.txt" in err
