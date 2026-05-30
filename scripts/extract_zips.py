@@ -34,6 +34,15 @@ import sys
 import zipfile
 from pathlib import Path
 
+# Allow direct invocation by putting the repo root on sys.path before importing
+# the sibling run-log helper.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts._runlog import RunLog  # noqa: E402
+from scripts import _runlog  # noqa: E402
+
 TARGET_SUFFIX = "_unzip"
 MARKER_NAME = ".extract_zips_source"
 MAX_SUFFIX = 999  # safety cap on -1, -2, ... search
@@ -57,6 +66,15 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Found {len(zips)} zip file(s) under {root}")
 
+    rl = RunLog(
+        "extract_zips",
+        input_root=root,
+        output_root=root,
+        argv=argv if argv is not None else sys.argv[1:],
+        log_dir=args.log_dir,
+        enabled=not args.no_runlog and not args.dry_run,
+    )
+
     extracted = 0
     renamed = 0
     skipped = 0
@@ -72,11 +90,13 @@ def main(argv: list[str] | None = None) -> int:
             action, target = _resolve_target(base_target, source_name, args.overwrite)
         except RuntimeError as exc:
             print(f"ERROR {rel}: {exc}", file=sys.stderr)
+            rl.record(zip_path, kind="zip", output=None, status="fail", error=exc)
             errors += 1
             continue
 
         if action == "skip":
             print(f"SKIP {rel} (already extracted at {target.name}/)")
+            rl.record(zip_path, kind="zip", output=target, status="skip")
             skipped += 1
             continue
 
@@ -114,10 +134,12 @@ def main(argv: list[str] | None = None) -> int:
             # one. Either way the dir at `target` is ours to remove.
             if target.exists():
                 shutil.rmtree(target, ignore_errors=True)
+            rl.record(zip_path, kind="zip", output=None, status="fail", error=exc)
             errors += 1
             continue
 
         print(f"OK {rel} -> {target.name}/")
+        rl.record(zip_path, kind="zip", output=target, status="ok")
         extracted += 1
 
     parts = [f"{extracted} extracted"]
@@ -129,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
         parts.append(f"{overwritten} overwritten")
     parts.append(f"{errors} errors")
     print(f"\nSummary: {', '.join(parts)}")
+    rl.finish(exit_code=1 if errors else 0)
     return 1 if errors else 0
 
 
@@ -221,6 +244,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "organic folders are still left alone."
         ),
     )
+    # This script manages its own idempotency via marker files; --overwrite is
+    # its force switch, so the ledger --force flag is omitted.
+    _runlog.add_args(parser, include_force=False)
     return parser.parse_args(argv)
 
 

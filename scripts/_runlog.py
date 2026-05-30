@@ -43,19 +43,25 @@ SCHEMA = 1
 _DEFAULT_LOG_SUBDIR = "_runlogs"
 
 
-def add_args(parser: argparse.ArgumentParser) -> None:
-    """Add the shared run-log flags to a script's argument parser."""
+def add_args(parser: argparse.ArgumentParser, *, include_force: bool = True) -> None:
+    """Add the shared run-log flags to a script's argument parser.
+
+    ``include_force=False`` omits ``--force`` for scripts that manage their own
+    idempotency (e.g. marker files) and so do not consult the ledger to decide
+    skips — there a ``--force`` flag would be a no-op.
+    """
     parser.add_argument(
         "--log-dir",
         default=None,
         help="Directory for the JSONL run-log (default: <output>/_runlogs).",
     )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Reprocess every input, ignoring the run-log ledger of past "
-        "successes (no idempotent skipping).",
-    )
+    if include_force:
+        parser.add_argument(
+            "--force",
+            action="store_true",
+            help="Reprocess every input, ignoring the run-log ledger of past "
+            "successes (no idempotent skipping).",
+        )
     parser.add_argument(
         "--no-runlog",
         action="store_true",

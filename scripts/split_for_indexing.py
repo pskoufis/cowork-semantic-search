@@ -30,6 +30,15 @@ import sys
 import zipfile
 from pathlib import Path
 
+# Allow direct invocation by putting the repo root on sys.path before importing
+# the sibling run-log helper.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts._runlog import RunLog  # noqa: E402
+from scripts import _runlog  # noqa: E402
+
 MIB = 1024 * 1024
 TEXT_LIMIT = 20 * MIB
 DOC_LIMIT = 500 * MIB
@@ -77,6 +86,19 @@ def main(argv: list[str] | None = None) -> int:
     for sub in (BATCHES, TOO_LARGE, TO_PDF, OTHER):
         (dst / sub).mkdir(parents=True, exist_ok=True)
 
+    # Constructed after the empty-output check and bucket mkdir so the run-log
+    # dir doesn't trip the "not empty" guard. Bucketing is a one-shot operation
+    # (output must be empty), so there is no idempotent re-run here — the
+    # run-log records the per-file classification + copy outcome for analysis.
+    rl = RunLog(
+        "split_for_indexing",
+        input_root=src,
+        output_root=dst,
+        argv=argv if argv is not None else sys.argv[1:],
+        log_dir=args.log_dir,
+        enabled=not args.no_runlog,
+    )
+
     counts = {BATCHES: 0, TOO_LARGE: 0, TO_PDF: 0, OTHER: 0}
     bytes_per_bucket = {BATCHES: 0, TOO_LARGE: 0, TO_PDF: 0, OTHER: 0}
 
@@ -95,20 +117,27 @@ def main(argv: list[str] | None = None) -> int:
                     size = entry.stat(follow_symlinks=False).st_size
                 except OSError as exc:
                     print(f"WARN: skipping {entry.path}: {exc}", file=sys.stderr)
+                    rl.record(entry.path, kind="unreadable", output=None,
+                              status="fail", error=exc)
                     continue
 
                 bucket = _classify(entry.name, size)
                 try:
                     if bucket is BATCHES:
                         writer.add(entry.path, entry.name)
+                        out = dst / BATCHES / (writer.current_name() or "")
                     else:
-                        shutil.copy2(entry.path, dst / bucket / entry.name)
+                        out = dst / bucket / entry.name
+                        shutil.copy2(entry.path, out)
                 except (PermissionError, FileNotFoundError) as exc:
                     print(f"WARN: failed to copy {entry.path}: {exc}", file=sys.stderr)
+                    rl.record(entry.path, kind=bucket, output=None,
+                              status="fail", error=exc)
                     continue
 
                 counts[bucket] += 1
                 bytes_per_bucket[bucket] += size
+                rl.record(entry.path, kind=bucket, output=out, status="ok")
                 progress.tick(counts, writer.current_name())
     except KeyboardInterrupt:
         interrupted = True
@@ -118,9 +147,9 @@ def main(argv: list[str] | None = None) -> int:
         progress.close()
 
     _print_summary(counts, bytes_per_bucket, writer.batch_count())
-    if interrupted:
-        return 130
-    return 0
+    exit_code = 130 if interrupted else 0
+    rl.finish(exit_code=exit_code)
+    return exit_code
 
 
 def _classify(name: str, size: int) -> str:
@@ -238,6 +267,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=DEFAULT_BATCH_SIZE,
         help=f"Files per batch zip (default {DEFAULT_BATCH_SIZE}).",
     )
+    # One-shot bucketing (output must be empty); no ledger skipping, so --force
+    # is omitted.
+    _runlog.add_args(parser, include_force=False)
     return parser.parse_args(argv)
 
 
