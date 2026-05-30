@@ -9,10 +9,22 @@ parsing / file-layout is exercised by the in-place unit tests.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
 from pathlib import Path
+
+
+def _runlog_items(dst: Path, script: str = "unpack_pst_folder") -> list[dict]:
+    logs = sorted((dst / "_runlogs").glob(f"{script}-*.jsonl"))
+    assert logs, "no run-log written"
+    items = []
+    for line in logs[-1].read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        if rec["event"] == "item":
+            items.append(rec)
+    return items
 
 
 def _msg(
@@ -257,3 +269,39 @@ def test_summary_includes_elapsed_seconds(
     assert rc == 0
     err = capsys.readouterr().err
     assert re.search(r"Processed 1 pst file\(s\) in \d+\.\d+s:", err), err
+
+
+# -- run-log + idempotent re-run -----------------------------------------
+
+
+def test_runlog_records_unpacks(tmp_path: Path, monkeypatch) -> None:
+    from scripts.unpack_pst_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _drop_pst(src / "a" / "foo.pst")
+    _install_iter(
+        monkeypatch, lambda p: [_msg(folder_path="Top", subject="x", body="y")]
+    )
+
+    assert main([str(src), str(dst)]) == 0
+    items = _runlog_items(dst)
+    assert {it["input"] for it in items} == {"a/foo.pst"}
+    assert items[0]["status"] == "ok"
+    assert items[0]["output"].endswith("foo_unpacked")
+
+
+def test_rerun_skips_done_psts(tmp_path: Path, monkeypatch) -> None:
+    from scripts.unpack_pst_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _drop_pst(src / "a.pst")
+    _drop_pst(src / "deep" / "b.pst")
+    _install_iter(
+        monkeypatch, lambda p: [_msg(folder_path="Top", subject="x", body="y")]
+    )
+
+    assert main([str(src), str(dst)]) == 0
+    assert main([str(src), str(dst)]) == 0
+    assert {it["status"] for it in _runlog_items(dst)} == {"skip"}

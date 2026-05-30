@@ -9,10 +9,22 @@ in-place unit tests.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 import os
 from pathlib import Path
+
+
+def _runlog_items(dst: Path, script: str = "unpack_msg_folder") -> list[dict]:
+    logs = sorted((dst / "_runlogs").glob(f"{script}-*.jsonl"))
+    assert logs, "no run-log written"
+    items = []
+    for line in logs[-1].read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        if rec["event"] == "item":
+            items.append(rec)
+    return items
 
 
 def _msg(
@@ -249,3 +261,35 @@ def test_summary_includes_elapsed_seconds(
     assert rc == 0
     err = capsys.readouterr().err
     assert re.search(r"Processed 1 msg file\(s\) in \d+\.\d+s:", err), err
+
+
+# -- run-log + idempotent re-run -----------------------------------------
+
+
+def test_runlog_records_extractions(tmp_path: Path, monkeypatch) -> None:
+    from scripts.unpack_msg_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _drop_msg(src / "a" / "foo.msg")
+    _install_reader(monkeypatch, lambda p: _msg(subject="x", body="y"))
+
+    assert main([str(src), str(dst)]) == 0
+    items = _runlog_items(dst)
+    assert {it["input"] for it in items} == {"a/foo.msg"}
+    assert items[0]["status"] == "ok"
+    assert items[0]["output"].endswith("foo.txt")
+
+
+def test_rerun_skips_done_msgs(tmp_path: Path, monkeypatch) -> None:
+    from scripts.unpack_msg_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _drop_msg(src / "a.msg")
+    _drop_msg(src / "deep" / "b.msg")
+    _install_reader(monkeypatch, lambda p: _msg(subject="x", body="y"))
+
+    assert main([str(src), str(dst)]) == 0
+    assert main([str(src), str(dst)]) == 0
+    assert {it["status"] for it in _runlog_items(dst)} == {"skip"}

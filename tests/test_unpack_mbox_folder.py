@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
 import pytest
 
 from tests.test_mbox_messages import _make_entry, _make_mbox
+
+
+def _runlog_items(out: Path, script: str = "unpack_mbox_folder") -> list[dict]:
+    logs = sorted((out / "_runlogs").glob(f"{script}-*.jsonl"))
+    assert logs, "no run-log written"
+    items = []
+    for line in logs[-1].read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        if rec["event"] == "item":
+            items.append(rec)
+    return items
 
 
 def _simple_mbox(path: Path) -> Path:
@@ -264,3 +276,63 @@ def test_summary_includes_elapsed_seconds(tmp_path: Path, capsys) -> None:
     err = capsys.readouterr().err
     # Summary like: "Processed 1 mbox file(s) in 0.0s: 1 succeeded, 0 failed."
     assert re.search(r"Processed 1 mbox file\(s\) in \d+\.\d+s:", err), err
+
+
+# -- run-log + idempotent re-run -----------------------------------------
+
+
+def test_runlog_records_unpacks(tmp_path: Path) -> None:
+    from scripts.unpack_mbox_folder import main
+
+    src = tmp_path / "in"
+    src.mkdir()
+    _simple_mbox(src / "alpha.mbox")
+    out = tmp_path / "out"
+
+    assert main([str(src), str(out)]) == 0
+    items = _runlog_items(out)
+    assert {it["input"] for it in items} == {"alpha.mbox"}
+    assert items[0]["status"] == "ok"
+    assert items[0]["output"].endswith("alpha")
+
+
+def test_rerun_does_not_create_duplicate_output_dirs(tmp_path: Path) -> None:
+    """The headline fix for bug #3: a second run must reuse the existing output
+    dir (skip it) instead of minting `alpha-1/` because the old one is 'in use'.
+    """
+    from scripts.unpack_mbox_folder import main
+
+    src = tmp_path / "in"
+    src.mkdir()
+    _simple_mbox(src / "alpha.mbox")
+    out = tmp_path / "out"
+
+    assert main([str(src), str(out)]) == 0
+
+    def _dirs() -> list[str]:
+        return sorted(
+            p.name for p in out.iterdir() if p.is_dir() and p.name != "_runlogs"
+        )
+
+    before = _dirs()
+    assert main([str(src), str(out)]) == 0
+    after = _dirs()
+
+    assert after == before == ["alpha"]  # no alpha-1 duplicate
+    assert {it["status"] for it in _runlog_items(out)} == {"skip"}
+
+
+def test_force_reprocesses_in_place(tmp_path: Path) -> None:
+    from scripts.unpack_mbox_folder import main
+
+    src = tmp_path / "in"
+    src.mkdir()
+    _simple_mbox(src / "alpha.mbox")
+    out = tmp_path / "out"
+
+    assert main([str(src), str(out)]) == 0
+    assert main([str(src), str(out), "--force"]) == 0
+
+    dirs = sorted(p.name for p in out.iterdir() if p.is_dir() and p.name != "_runlogs")
+    assert dirs == ["alpha"]  # reprocessed in place, no alpha-1
+    assert {it["status"] for it in _runlog_items(out)} == {"ok"}
