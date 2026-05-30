@@ -103,6 +103,27 @@ def test_all_strategies_failing_raises_original(monkeypatch) -> None:
         read_message(Path("whatever.msg"))
 
 
+def test_message_direct_strategy_recovers_when_openmsg_fails(monkeypatch) -> None:
+    """Category A (garbled class type): openMsg can't classify it and returns a
+    contentless base file, but constructing Message(...) directly reads the
+    body. Here every openMsg call fails/contentless and Message yields text."""
+    import extract_msg
+    from extract_msg.exceptions import UnrecognizedMSGTypeError
+    from msg_handling.messages import read_message
+
+    def failing_openMsg(path, **kwargs):
+        if not kwargs:
+            raise UnrecognizedMSGTypeError("garbled class type")
+        return _FakeMsg(body="", subject="")  # strict=False/override: no text
+
+    recovered = _FakeMsg(body="real recovered body", subject="Subj")
+    monkeypatch.setattr(extract_msg, "openMsg", failing_openMsg)
+    monkeypatch.setattr(extract_msg, "Message", lambda path, **kw: recovered)
+
+    out = read_message(Path("whatever.msg"))
+    assert out.body == "real recovered body"
+
+
 def test_healthy_file_is_not_sent_through_fallback(monkeypatch) -> None:
     """When the normal parse succeeds, the fallback options are never tried."""
     import extract_msg

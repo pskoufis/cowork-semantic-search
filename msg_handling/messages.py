@@ -35,17 +35,30 @@ class ParsedMessage:
     attachments: Tuple[ParsedAttachment, ...]
 
 
-# Best-effort fallbacks tried only after the normal parse fails. Each entry is
-# a set of ``openMsg`` options:
-#   * ``overrideEncoding="cp1252"`` rescues files whose code page is
-#     mis-detected (e.g. extract-msg guessing ``euc_kr``) or unmapped
-#     ("unknown encoding"), common in Western-European corpora.
-#   * ``strict=False`` additionally bypasses message-class detection, recovering
-#     files whose class type is stored 8-bit but flagged as Unicode (the garbled
-#     "Could not recognize MSG class type" case).
-_FALLBACK_OPEN_KWARGS = (
-    {"overrideEncoding": "cp1252"},
-    {"strict": False, "overrideEncoding": "cp1252"},
+# Best-effort openers tried in order, only after the normal parse fails. Each
+# takes ``(extract_msg, path)`` and returns a context-managed message object:
+#   1. ``openMsg(overrideEncoding="cp1252")`` rescues files whose code page is
+#      mis-detected (e.g. extract-msg guessing ``euc_kr``) or unmapped
+#      ("unknown encoding"), common in Western-European corpora.
+#   2. ``openMsg(strict=False, …)`` bypasses message-class detection (returns a
+#      bare file) for files whose class type is unrecognizable.
+#   3. ``Message(overrideEncoding="cp1252")`` constructs the full message reader
+#      *directly*, skipping class detection entirely — this is what recovers
+#      files whose class type is stored 8-bit but flagged Unicode (the garbled
+#      "Could not recognize MSG class type" case), where ``openMsg`` would only
+#      hand back a contentless base file.
+def _via_open_msg(**kwargs):
+    return lambda em, path: em.openMsg(str(path), **kwargs)
+
+
+def _via_message(**kwargs):
+    return lambda em, path: em.Message(str(path), **kwargs)
+
+
+_FALLBACK_OPENERS = (
+    _via_open_msg(overrideEncoding="cp1252"),
+    _via_open_msg(strict=False, overrideEncoding="cp1252"),
+    _via_message(overrideEncoding="cp1252"),
 )
 
 
@@ -72,13 +85,11 @@ def read_message(msg_path: Path) -> ParsedMessage:
         ) from exc
 
     try:
-        return _read_with(extract_msg, AttachmentType, msg_path)
+        return _read_with(extract_msg, AttachmentType, msg_path, _via_open_msg())
     except Exception as first_exc:  # noqa: BLE001 — best-effort recovery follows
-        for open_kwargs in _FALLBACK_OPEN_KWARGS:
+        for opener in _FALLBACK_OPENERS:
             try:
-                recovered = _read_with(
-                    extract_msg, AttachmentType, msg_path, **open_kwargs
-                )
+                recovered = _read_with(extract_msg, AttachmentType, msg_path, opener)
             except Exception:  # noqa: BLE001 — try the next strategy
                 continue
             if _has_text(recovered):
@@ -86,11 +97,11 @@ def read_message(msg_path: Path) -> ParsedMessage:
         raise first_exc
 
 
-def _read_with(extract_msg, AttachmentType, msg_path: Path, **open_kwargs) -> ParsedMessage:
-    """Open and read a .msg with the given ``openMsg`` options into a
-    ``ParsedMessage``. Shared by the normal parse and every fallback strategy."""
+def _read_with(extract_msg, AttachmentType, msg_path: Path, opener) -> ParsedMessage:
+    """Open and read a .msg with the given ``opener`` into a ``ParsedMessage``.
+    Shared by the normal parse and every fallback strategy."""
     attachments: list[ParsedAttachment] = []
-    with extract_msg.openMsg(str(msg_path), **open_kwargs) as msg:
+    with opener(extract_msg, msg_path) as msg:
         for att in msg.attachments:
             parsed = _parse_attachment(att, AttachmentType)
             if parsed is not None:
