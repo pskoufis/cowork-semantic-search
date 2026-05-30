@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import fitz  # PyMuPDF, used here only to inspect output PDFs
 import pytest
 from PIL import Image
+
+
+def _runlog_items(dst: Path) -> list[dict]:
+    logs = sorted((dst / "_runlogs").glob("images_to_pdf-*.jsonl"))
+    assert logs, "no run-log written"
+    items = []
+    for line in logs[-1].read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        if rec["event"] == "item":
+            items.append(rec)
+    return items
 
 
 def _make_image(path: Path, mode: str = "RGB", size: tuple[int, int] = (8, 8)) -> Path:
@@ -258,4 +270,86 @@ def test_rejects_missing_input_dir(tmp_path: Path) -> None:
     from scripts import images_to_pdf as mod
 
     src, dst = tmp_path / "nope", tmp_path / "dst"
+    assert mod.main([str(src), str(dst)]) == 2
+
+
+# --- run-log + idempotent re-run --------------------------------------------
+
+
+def test_runlog_records_conversions(tmp_path: Path) -> None:
+    from scripts import images_to_pdf as mod
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _make_image(src / "a.png", "RGB")
+
+    assert mod.main([str(src), str(dst)]) == 0
+    items = _runlog_items(dst)
+    by_input = {it["input"]: it for it in items}
+    assert by_input["a.png"]["status"] == "ok"
+    assert by_input["a.png"]["output"].endswith("a.pdf")
+
+
+def test_rerun_skips_already_converted(tmp_path: Path) -> None:
+    """A second run skips done images — no rewrite, no duplicate PDFs, and the
+    'output not empty' guard does not fire on our own prior output."""
+    from scripts import images_to_pdf as mod
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _make_image(src / "a.png", "RGB")
+    _make_image(src / "b.png", "RGB")
+
+    assert mod.main([str(src), str(dst)]) == 0
+    before = {p.name: p.stat().st_mtime_ns for p in dst.glob("*.pdf")}
+
+    assert mod.main([str(src), str(dst)]) == 0
+    after = {p.name: p.stat().st_mtime_ns for p in dst.glob("*.pdf")}
+
+    assert after == before  # untouched — skipped, not rewritten
+    assert {it["status"] for it in _runlog_items(dst)} == {"skip"}
+
+
+def test_retry_after_fix_converts_only_the_fixed_image(tmp_path: Path) -> None:
+    from scripts import images_to_pdf as mod
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _make_image(src / "good.png", "RGB")
+    (src / "broken.png").write_bytes(b"not a real png")
+
+    assert mod.main([str(src), str(dst)]) == 0  # corrupt image just skipped
+    assert not (dst / "broken.pdf").exists()
+
+    # "Fix" the broken image with real content and re-run.
+    _make_image(src / "broken.png", "RGB")
+    assert mod.main([str(src), str(dst)]) == 0
+
+    assert (dst / "broken.pdf").is_file()
+    by_input = {it["input"]: it["status"] for it in _runlog_items(dst)}
+    assert by_input["broken.png"] == "ok"
+    assert by_input["good.png"] == "skip"
+
+
+def test_force_overwrites_in_place_no_duplicates(tmp_path: Path) -> None:
+    from scripts import images_to_pdf as mod
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _make_image(src / "a.png", "RGB")
+
+    assert mod.main([str(src), str(dst)]) == 0
+    assert mod.main([str(src), str(dst), "--force"]) == 0
+
+    # Reprocessed in place — still exactly one PDF, no a-1.pdf.
+    assert sorted(p.name for p in dst.glob("*.pdf")) == ["a.pdf"]
+    assert {it["status"] for it in _runlog_items(dst)} == {"ok"}
+
+
+def test_rejects_foreign_non_empty_output_still(tmp_path: Path) -> None:
+    """The 'not empty' guard still protects an output dir we did not create
+    (no prior run-log present)."""
+    from scripts import images_to_pdf as mod
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (dst / "preexisting.pdf").write_bytes(b"x")
+
     assert mod.main([str(src), str(dst)]) == 2

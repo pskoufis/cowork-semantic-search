@@ -195,6 +195,46 @@ def test_latest_record_wins_in_ledger(tmp_path: Path) -> None:
     assert rl3.done_output(inp) == target
 
 
+def test_planned_output_returns_last_output_even_when_stale(tmp_path: Path) -> None:
+    """planned_output gives the prior output for a known input regardless of
+    freshness — so a reprocess (force, or changed input) overwrites in place
+    instead of allocating a duplicate name."""
+    from scripts._runlog import RunLog
+
+    src = tmp_path / "in"
+    out = tmp_path / "out"
+    inp = _make_input(src / "a.jpg", "A")
+    target = out / "a.pdf"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("pdf")
+
+    rl1 = RunLog("s", input_root=src, output_root=out, argv=[])
+    rl1.record(inp, kind="img", output=target, status="ok")
+    rl1.finish(exit_code=0)
+
+    inp.write_text("A changed")  # stale now — done_output would say None
+    rl2 = RunLog("s", input_root=src, output_root=out, argv=[])
+    assert rl2.done_output(inp) is None
+    assert rl2.planned_output(inp) == target
+
+
+def test_planned_output_none_for_failed_or_unseen(tmp_path: Path) -> None:
+    from scripts._runlog import RunLog
+
+    src = tmp_path / "in"
+    out = tmp_path / "out"
+    failed = _make_input(src / "bad.jpg", "B")
+    unseen = _make_input(src / "new.jpg", "N")
+
+    rl1 = RunLog("s", input_root=src, output_root=out, argv=[])
+    rl1.record(failed, kind="img", output=None, status="fail", error=OSError("x"))
+    rl1.finish(exit_code=1)
+
+    rl2 = RunLog("s", input_root=src, output_root=out, argv=[])
+    assert rl2.planned_output(failed) is None
+    assert rl2.planned_output(unseen) is None
+
+
 def test_force_ignores_ledger(tmp_path: Path) -> None:
     from scripts._runlog import RunLog
 

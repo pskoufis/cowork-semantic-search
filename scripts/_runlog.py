@@ -117,8 +117,11 @@ class RunLog:
             if log_dir is not None
             else self.output_root / _DEFAULT_LOG_SUBDIR
         )
-        if not force:
-            self._ledger = _load_ledger(self.log_dir, script)
+        # Always load the ledger: ``done_output`` honours ``--force`` by
+        # returning None (reprocess), but ``planned_output`` still needs the
+        # prior input->output mapping so a forced reprocess overwrites in place
+        # rather than minting a duplicate name.
+        self._ledger = _load_ledger(self.log_dir, script)
 
         self.run_id = _new_run_id()
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -165,6 +168,22 @@ class RunLog:
         if rec.get("input_mtime") != st.st_mtime or rec.get("input_size") != st.st_size:
             return None
         return out_path
+
+    def planned_output(self, input_path: Path | str) -> Path | None:
+        """Return the last output path recorded for this input, regardless of
+        status or freshness, or ``None`` if it was never produced.
+
+        Use this to reuse a stable output location when *re*processing an input
+        (under ``--force`` or because the input changed), so the new result
+        overwrites the old in place instead of getting a duplicate name.
+        Failed items recorded no output, so this returns ``None`` for them.
+        """
+        if not self.enabled:
+            return None
+        rec = self._ledger.get(self._key(input_path))
+        if rec and rec.get("output"):
+            return Path(rec["output"])
+        return None
 
     def record(
         self,
