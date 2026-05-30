@@ -35,6 +35,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from msg_handling.unpack import ensure_unpacked  # noqa: E402
+from scripts._runlog import RunLog  # noqa: E402
+from scripts import _runlog  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,7 +65,17 @@ def main(argv: list[str] | None = None) -> int:
         f"Found {len(msgs)} msg file(s) under {src}",
         file=sys.stderr,
     )
+    rl = RunLog(
+        "unpack_msg_folder",
+        input_root=src,
+        output_root=dst,
+        argv=argv if argv is not None else sys.argv[1:],
+        log_dir=args.log_dir,
+        force=args.force,
+        enabled=not args.no_runlog,
+    )
     succeeded = 0
+    skipped = 0
     failed = 0
     started = time.monotonic()
 
@@ -72,7 +84,16 @@ def main(argv: list[str] | None = None) -> int:
         rel = msg_path.relative_to(src)
         rel_parent = msg_path.parent.relative_to(src)
         target_dir = dst / rel_parent
+        txt_out = target_dir / f"{msg_path.stem}.txt"
+        # Idempotent re-run: skip a .msg whose .txt is already present and the
+        # source is unchanged.
+        if (done := rl.done_output(msg_path)) is not None:
+            skipped += 1
+            print(f"[{i}/{total}] skip (done) {rel}", file=sys.stderr)
+            rl.record(msg_path, kind="msg", output=done, status="skip")
+            continue
         print(f"[{i}/{total}] extracting {rel}", file=sys.stderr)
+        item_started = time.monotonic()
         try:
             ensure_unpacked(msg_path, target=target_dir)
         except Exception as exc:  # noqa: BLE001 — per-file isolation by design
@@ -81,27 +102,35 @@ def main(argv: list[str] | None = None) -> int:
                 f"error: failed to unpack {msg_path}: {exc}",
                 file=sys.stderr,
             )
+            rl.record(msg_path, kind="msg", output=None, status="fail", error=exc)
             continue
         # ``ensure_unpacked`` swallows per-file parse failures and logs to
         # stderr without raising. To still surface those in the exit code
         # and summary, treat a missing ``.txt`` after a call as a failure.
-        if not (target_dir / f"{msg_path.stem}.txt").exists():
+        if not txt_out.exists():
             failed += 1
             print(
                 f"warning: {rel}: no .txt produced "
                 "(parse failure; see prior msg_handling warning)",
                 file=sys.stderr,
             )
+            rl.record(msg_path, kind="msg", output=None, status="fail",
+                      error="no .txt produced (parse failure)")
             continue
         succeeded += 1
+        rl.record(msg_path, kind="msg", output=txt_out, status="ok",
+                  duration_s=round(time.monotonic() - item_started, 3))
 
     elapsed = time.monotonic() - started
+    skipped_part = f", {skipped} skipped" if skipped else ""
     print(
         f"Processed {total} msg file(s) in {elapsed:.1f}s: "
-        f"{succeeded} succeeded, {failed} failed.",
+        f"{succeeded} succeeded, {failed} failed{skipped_part}.",
         file=sys.stderr,
     )
-    return 0 if failed == 0 else 1
+    exit_code = 0 if failed == 0 else 1
+    rl.finish(exit_code=exit_code)
+    return exit_code
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -119,6 +148,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "output_folder",
         help="Folder to write the extracted .txt + attachments tree into",
     )
+    _runlog.add_args(parser)
     return parser.parse_args(argv)
 
 

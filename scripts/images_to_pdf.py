@@ -23,7 +23,13 @@ Behaviour notes:
   silent overwrite.
 
 A single unreadable or corrupt image logs a ``WARN`` and is skipped; it never
-aborts the run. ``OUTPUT_DIR`` must not exist or must be empty.
+aborts the run. ``OUTPUT_DIR`` must not exist, must be empty, or must be a
+directory this script populated on an earlier run — a re-run then skips images
+already converted (output present, source unchanged) and only (re)processes new
+or previously-failed ones. A structured JSONL run-log is written under
+``OUTPUT_DIR/_runlogs/`` (override with ``--log-dir``); it records per-image
+status and drives the idempotent re-run. Pass ``--force`` to reconvert
+everything in place, ``--no-runlog`` to disable the log.
 
 Requires the ``images`` optional dependencies (``pip install -e '.[images]'``):
 Pillow and pillow-heif.
@@ -35,6 +41,15 @@ import argparse
 import os
 import sys
 from pathlib import Path
+
+# Allow direct invocation (``python scripts/images_to_pdf.py``) by putting the
+# repo root on sys.path before importing the sibling run-log helper.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts._runlog import RunLog  # noqa: E402
+from scripts import _runlog  # noqa: E402
 
 IMAGE_EXTS = {
     ".jpg",
@@ -63,12 +78,23 @@ def main(argv: list[str] | None = None) -> int:
     if not src.exists() or not src.is_dir():
         print(f"ERROR: input dir {src} does not exist or is not a directory", file=sys.stderr)
         return 2
+    log_dir = Path(args.log_dir).expanduser() if args.log_dir else dst / "_runlogs"
     if dst.exists():
         if not dst.is_dir():
             print(f"ERROR: output path {dst} exists and is not a directory", file=sys.stderr)
             return 2
-        if any(dst.iterdir()):
-            print(f"ERROR: output dir {dst} is not empty", file=sys.stderr)
+        # The output dir may be non-empty only when it is *our own* prior output
+        # (a run-log for this script is present) or the caller passes --force.
+        # That is what makes an idempotent re-run possible while still guarding
+        # against scribbling into an unrelated populated directory.
+        own_prior = log_dir.is_dir() and any(log_dir.glob("images_to_pdf-*.jsonl"))
+        others = [e for e in dst.iterdir() if e.name != "_runlogs"]
+        if others and not own_prior and not args.force:
+            print(
+                f"ERROR: output dir {dst} is not empty (pass --force to write "
+                "into an existing directory)",
+                file=sys.stderr,
+            )
             return 2
 
     # Import lazily so --help and the pre-flight checks work without the
@@ -86,8 +112,17 @@ def main(argv: list[str] | None = None) -> int:
     register_heif_opener()
 
     dst.mkdir(parents=True, exist_ok=True)
+    rl = RunLog(
+        "images_to_pdf",
+        input_root=src,
+        output_root=dst,
+        argv=argv if argv is not None else sys.argv[1:],
+        log_dir=args.log_dir,
+        force=args.force,
+        enabled=not args.no_runlog,
+    )
 
-    converted = skipped = failed = 0
+    converted = skipped = failed = already = 0
     used_stems: set[str] = set()
     progress = _make_progress()
 
@@ -109,11 +144,39 @@ def main(argv: list[str] | None = None) -> int:
                     skipped += 1
                     continue
 
-                out_path = _unique_out_path(dst, entry.name, used_stems)
+                src_path = Path(entry.path)
+                # Idempotent re-run: a previously-converted image (output present,
+                # input unchanged) is skipped instead of re-rendered.
+                done = rl.done_output(src_path)
+                if done is not None:
+                    already += 1
+                    used_stems.add(done.stem)
+                    rl.record(src_path, kind="image", output=done, status="skip")
+                    progress.tick(converted, skipped, failed)
+                    continue
+
+                # Reuse the prior output path when reprocessing a known image
+                # (under --force, or because it changed) so we overwrite in
+                # place rather than minting a duplicate `<stem>-1.pdf`.
+                planned = rl.planned_output(src_path)
+                if planned is not None:
+                    out_path = planned
+                    used_stems.add(out_path.stem)
+                else:
+                    out_path = _unique_out_path(dst, entry.name, used_stems)
+
                 if _convert_one(Image, entry.path, out_path):
                     converted += 1
+                    rl.record(src_path, kind="image", output=out_path, status="ok")
                 else:
                     failed += 1
+                    rl.record(
+                        src_path,
+                        kind="image",
+                        output=None,
+                        status="fail",
+                        error="image could not be read or converted (see WARN)",
+                    )
                 progress.tick(converted, skipped, failed)
     except KeyboardInterrupt:
         interrupted = True
@@ -121,10 +184,10 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         progress.close()
 
-    _print_summary(converted, skipped, failed)
-    if interrupted:
-        return 130
-    return 0
+    _print_summary(converted, skipped, failed, already)
+    exit_code = 130 if interrupted else 0
+    rl.finish(exit_code=exit_code)
+    return exit_code
 
 
 def _unique_out_path(dst: Path, src_name: str, used_stems: set[str]) -> Path:
@@ -136,7 +199,9 @@ def _unique_out_path(dst: Path, src_name: str, used_stems: set[str]) -> Path:
     stem = Path(src_name).stem
     candidate = stem
     n = 0
-    while candidate in used_stems:
+    # Avoid both within-run reservations and PDFs already on disk (e.g. from a
+    # prior run for a different source) so we never silently overwrite one.
+    while candidate in used_stems or (dst / f"{candidate}.pdf").exists():
         n += 1
         candidate = f"{stem}-{n}"
     if n:
@@ -232,11 +297,12 @@ def _make_progress() -> _Progress:
     return _Progress()
 
 
-def _print_summary(converted: int, skipped: int, failed: int) -> None:
+def _print_summary(converted: int, skipped: int, failed: int, already: int = 0) -> None:
     print()
+    already_part = f", {already} already done" if already else ""
     print(
         f"Done. {converted} converted, {skipped} skipped (non-image), "
-        f"{failed} failed."
+        f"{failed} failed{already_part}."
     )
 
 
@@ -251,8 +317,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("input_dir", help="Flat folder of image files.")
     parser.add_argument(
         "output_dir",
-        help="Destination for PDFs. Must not exist, or must exist and be empty.",
+        help="Destination for PDFs. Must not exist, must be empty, or must be a "
+        "directory this script populated before (re-runs skip done images).",
     )
+    _runlog.add_args(parser)
     return parser.parse_args(argv)
 
 

@@ -12,8 +12,21 @@ the same way test_unpack_msg_folder.py does.
 from __future__ import annotations
 
 import io
+import json
+import shutil
 import zipfile
 from pathlib import Path
+
+
+def _runlog_items(dst: Path, script: str = "extract_archives_folder") -> list[dict]:
+    logs = sorted((dst / "_runlogs").glob(f"{script}-*.jsonl"))
+    assert logs, "no run-log written"
+    items = []
+    for line in logs[-1].read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        if rec["event"] == "item":
+            items.append(rec)
+    return items
 
 
 def _zip_bytes(members: dict[str, bytes]) -> bytes:
@@ -368,3 +381,156 @@ def test_copy_others_skips_macos_metadata(tmp_path):
     assert not (dst / "._real.txt").exists()
     assert not (dst / ".DS_Store").exists()
     assert not (dst / "__MACOSX").exists()
+
+
+# -- run-log + idempotent re-run + robustness fixes ----------------------
+
+
+def test_runlog_records_archive_extractions(tmp_path):
+    from scripts.extract_archives_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write_zip(src / "a.zip", {"leaf.txt": b"x"})
+
+    assert main([str(src), str(dst)]) == 0
+    zips = [it for it in _runlog_items(dst) if it["kind"] == "zip"]
+    assert zips and zips[0]["status"] == "ok"
+    assert zips[0]["output"].endswith("a")
+
+
+def test_rerun_skips_all_nested_archives(tmp_path, monkeypatch):
+    """Second run skips both the outer and the nested zip — no re-extraction —
+    proving the loaded-once ledger drives idempotency through the recursion."""
+    import scripts.extract_archives_folder as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    inner = _zip_bytes({"leaf.txt": b"x"})
+    _write_zip(src / "outer.zip", {"inner.zip": inner})
+
+    assert mod.main([str(src), str(dst)]) == 0
+
+    calls: list[str] = []
+    real = mod._extract_zip
+    monkeypatch.setattr(
+        mod, "_extract_zip",
+        lambda z, t: (calls.append(Path(z).name), real(z, t))[1],
+    )
+    assert mod.main([str(src), str(dst)]) == 0
+
+    assert calls == []  # nothing re-extracted
+    statuses = {it["input"]: it["status"] for it in _runlog_items(dst)}
+    assert set(statuses.values()) == {"skip"}
+    assert any("outer.zip" in k for k in statuses)
+    assert any("inner.zip" in k for k in statuses)
+
+
+def test_zip_extraction_streams_members_not_read_whole(tmp_path, monkeypatch):
+    """Members are streamed via shutil.copyfileobj rather than srcf.read() into
+    memory (bug #5) — proven by spying on copyfileobj."""
+    import scripts.extract_archives_folder as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    payload = b"y" * 50_000
+    _write_zip(src / "big.zip", {"big.bin": payload})
+
+    used: list[int] = []
+    real = shutil.copyfileobj
+    monkeypatch.setattr(
+        mod.shutil, "copyfileobj",
+        lambda s, d, *a, **k: (used.append(1), real(s, d, *a, **k))[1],
+    )
+
+    assert mod.main([str(src), str(dst)]) == 0
+    assert (dst / "big" / "big.bin").read_bytes() == payload
+    assert used  # streaming path exercised
+
+
+def test_partial_zip_dir_removed_on_failure(tmp_path, monkeypatch):
+    """A zip that fails mid-extract leaves no partial dir and is recorded as a
+    failure, so a re-run retries it (bug #6)."""
+    import scripts.extract_archives_folder as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write_zip(src / "a.zip", {"f1.txt": b"one", "f2.txt": b"two"})
+
+    real = shutil.copyfileobj
+    state = {"n": 0}
+
+    def boom(s, d, *a, **k):
+        state["n"] += 1
+        if state["n"] == 2:
+            raise OSError("disk full")
+        return real(s, d, *a, **k)
+
+    monkeypatch.setattr(mod.shutil, "copyfileobj", boom)
+
+    assert mod.main([str(src), str(dst)]) == 1
+    assert not (dst / "a").exists()  # partial extraction cleaned up
+    assert any(it["status"] == "fail" for it in _runlog_items(dst))
+
+
+def test_msg_failure_does_not_delete_sibling_outputs(tmp_path, monkeypatch):
+    """A .msg parse failure must NOT remove the shared parent dir — that would
+    wipe a sibling .msg's already-written output. Names are chosen so the good
+    msg is processed BEFORE the failing one, so a catastrophic cleanup would be
+    observable."""
+    from scripts.extract_archives_folder import main
+    from msg_handling import unpack
+    from msg_handling.messages import ParsedMessage
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "a_ok.msg").write_bytes(b"\x00")
+    (src / "sub" / "z_bad.msg").write_bytes(b"\x00")
+
+    def reader(p):
+        p = Path(p)
+        if p.stem == "z_bad":
+            raise ValueError("corrupt msg")
+        return ParsedMessage(
+            from_addr="a@x", to="b@x", cc="", subject="ok",
+            date="Mon, 1 Jan 2024 00:00:00 +0000", message_id="<a@x>",
+            body="good body", attachments=(),
+        )
+
+    monkeypatch.setattr(unpack, "read_message", reader)
+
+    assert main([str(src), str(dst)]) == 1
+    # The good sibling, written before the failure, survives.
+    assert (dst / "sub" / "a_ok.txt").is_file()
+
+
+def test_orphan_secondary_rar_volume_warns(tmp_path, capsys):
+    """A .partN.rar (N>1) whose first volume is absent is otherwise silently
+    skipped; surface a warning so the orphaned set isn't missed (bug #8)."""
+    from scripts.extract_archives_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (src / "movie.part2.rar").write_bytes(b"Rar!\x1a\x07")
+    (src / "movie.part3.rar").write_bytes(b"Rar!\x1a\x07")
+
+    main([str(src), str(dst)])
+    err = capsys.readouterr().err
+    assert "movie" in err and "first volume" in err.lower()
+
+
+def test_complete_rar_set_does_not_warn(tmp_path, capsys):
+    from scripts.extract_archives_folder import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    # First volume present — not an orphan, no warning.
+    for n in (1, 2, 3):
+        (src / f"set.part{n}.rar").write_bytes(b"Rar!\x1a\x07")
+
+    main([str(src), str(dst)])
+    err = capsys.readouterr().err
+    assert "first volume" not in err.lower()

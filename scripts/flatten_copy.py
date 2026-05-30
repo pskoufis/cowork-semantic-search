@@ -18,6 +18,15 @@ import sys
 import time
 from pathlib import Path
 
+# Allow direct invocation (``python scripts/flatten_copy.py``) by putting the
+# repo root on sys.path before importing the sibling run-log helper.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts._runlog import RunLog  # noqa: E402
+from scripts import _runlog  # noqa: E402
+
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
@@ -45,34 +54,75 @@ def main(argv: list[str] | None = None) -> int:
         f"Found {len(files)} regular file(s) under {src}",
         file=sys.stderr,
     )
+    rl = RunLog(
+        "flatten_copy",
+        input_root=src,
+        output_root=dst,
+        argv=argv if argv is not None else sys.argv[1:],
+        log_dir=args.log_dir,
+        force=args.force,
+        enabled=not args.no_runlog,
+    )
     used_names: set[str] = set()
     copied = 0
+    skipped = 0
     failed = 0
     started = time.monotonic()
+    exit_code = 0
 
     total = len(files)
     for i, src_file in enumerate(files, start=1):
         rel = src_file.relative_to(src)
-        dst_name = _pick_dst_name(src_file.name, dst, used_names)
+        # Idempotent re-run: skip an input already copied (output present,
+        # input unchanged). This is what stops a second run from re-copying
+        # the whole tree under `_1`/`_2` names.
+        if (done := rl.done_output(src_file)) is not None:
+            skipped += 1
+            print(f"[{i}/{total}] skip (done) {rel}", file=sys.stderr)
+            rl.record(src_file, kind="file", output=done, status="skip")
+            continue
+        # Reuse the prior destination when reprocessing a known input (--force,
+        # or an edited source) so we overwrite in place instead of minting an
+        # `a_1.txt` duplicate. New inputs (ledger empty for them) still get
+        # collision-suffixed against existing names.
+        planned = rl.planned_output(src_file)
+        dst_name = (
+            planned.name if planned is not None
+            else _pick_dst_name(src_file.name, dst, used_names)
+        )
         used_names.add(dst_name)
         print(f"[{i}/{total}] copying {rel} -> {dst_name}", file=sys.stderr)
+        item_started = time.monotonic()
         try:
             shutil.copy2(src_file, dst / dst_name)
         except Exception as exc:  # noqa: BLE001 — per-file isolation by design
             failed += 1
+            # Drop a half-written file so a re-run starts clean.
+            try:
+                (dst / dst_name).unlink(missing_ok=True)
+            except OSError:
+                pass
             print(
                 f"error: failed to copy {rel}: {exc}",
                 file=sys.stderr,
             )
+            rl.record(src_file, kind="file", output=None, status="fail",
+                      error=exc)
             continue
         copied += 1
+        rl.record(src_file, kind="file", output=dst / dst_name, status="ok",
+                  duration_s=round(time.monotonic() - item_started, 3))
 
     elapsed = time.monotonic() - started
+    skipped_part = f" {skipped} skipped," if skipped else ""
     print(
-        f"Copied {copied} file(s) into {dst} ({failed} failed) in {elapsed:.1f}s.",
+        f"Copied {copied} file(s) into {dst} ({failed} failed)"
+        f"{skipped_part} in {elapsed:.1f}s.",
         file=sys.stderr,
     )
-    return 0 if failed == 0 else 1
+    exit_code = 0 if failed == 0 else 1
+    rl.finish(exit_code=exit_code)
+    return exit_code
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -84,6 +134,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("source_folder", help="Folder to copy files from")
     parser.add_argument("target_folder", help="Folder to copy files into (flat)")
+    _runlog.add_args(parser)
     return parser.parse_args(argv)
 
 

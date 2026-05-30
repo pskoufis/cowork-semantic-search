@@ -42,6 +42,15 @@ import sys
 import zipfile
 from pathlib import Path
 
+# Allow direct invocation by putting the repo root on sys.path before importing
+# the sibling run-log helper.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts._runlog import RunLog  # noqa: E402
+from scripts import _runlog  # noqa: E402
+
 MARKER_SUFFIX = ".flat_extracted"  # full marker name: .<zipname>.flat_extracted
 LOG_PREFIX = "extract_zips_flat-"
 LOG_SUFFIX = ".log"
@@ -65,6 +74,15 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Found {len(zips)} zip file(s) under {root}")
 
+    rl = RunLog(
+        "extract_zips_flat",
+        input_root=root,
+        output_root=root,
+        argv=argv if argv is not None else sys.argv[1:],
+        log_dir=args.log_dir,
+        enabled=not args.no_runlog and not args.dry_run,
+    )
+
     extracted = 0
     skipped = 0
     errors = 0
@@ -79,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if marker.exists():
             print(f"SKIP {rel} (already flat-extracted)")
+            rl.record(zip_path, kind="zip", output=marker, status="skip")
             skipped += 1
             continue
 
@@ -86,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
             written, renamed = _flat_extract(zip_path, dry_run=args.dry_run)
         except (zipfile.BadZipFile, RuntimeError, OSError, ValueError) as exc:
             print(f"ERROR {rel}: {exc}", file=sys.stderr)
+            rl.record(zip_path, kind="zip", output=None, status="fail", error=exc)
             errors += 1
             continue
 
@@ -100,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         renamed_note = f" ({renamed} renamed for collision)" if renamed else ""
         verb = "DRY-RUN" if args.dry_run else "OK"
         print(f"{verb} {rel} -> {len(written)} file(s){renamed_note}")
+        rl.record(zip_path, kind="zip", output=marker, status="ok")
         extracted += 1
         total_files += len(written)
         total_renamed += renamed
@@ -119,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nSummary: {', '.join(parts)}")
     if log_path is not None:
         print(f"Log: {log_path}")
+    rl.finish(exit_code=1 if errors else 0)
     return 1 if errors else 0
 
 
@@ -234,6 +256,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="List what would be extracted without writing anything (no log either).",
     )
+    # Idempotency is handled by marker files, so the ledger --force is omitted.
+    _runlog.add_args(parser, include_force=False)
     return parser.parse_args(argv)
 
 

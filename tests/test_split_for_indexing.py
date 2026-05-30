@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 
@@ -12,6 +13,17 @@ def _write(p: Path, size: int = 1) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"x" * size)
     return p
+
+
+def _runlog_items(dst: Path, script: str = "split_for_indexing") -> list[dict]:
+    logs = sorted((dst / "_runlogs").glob(f"{script}-*.jsonl"))
+    assert logs, "no run-log written"
+    items = []
+    for line in logs[-1].read_text(encoding="utf-8").splitlines():
+        rec = json.loads(line)
+        if rec["event"] == "item":
+            items.append(rec)
+    return items
 
 
 def _list_zip(path: Path) -> list[str]:
@@ -261,6 +273,44 @@ def test_batches_roll_at_configured_size(tmp_path: Path) -> None:
     assert sorted(all_names) == [f"f{i:02d}.txt" for i in range(7)]
 
 
+def test_batches_roll_at_byte_limit(tmp_path: Path) -> None:
+    """A batch also rolls when accumulated (uncompressed) input bytes would
+    exceed --batch-bytes, independent of the file count."""
+    from scripts import split_for_indexing as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    # Four 100-byte files, byte limit 250 -> two files per batch.
+    for i in range(4):
+        _write(src / f"f{i:02d}.txt", 100)
+
+    assert mod.main([str(src), str(dst), "--batch-bytes", "250"]) == 0
+
+    batches = sorted((dst / "BATCHES").glob("*.zip"))
+    assert [len(_list_zip(b)) for b in batches] == [2, 2]
+    all_names = []
+    for b in batches:
+        all_names.extend(_list_zip(b))
+    assert sorted(all_names) == [f"f{i:02d}.txt" for i in range(4)]
+
+
+def test_byte_and_count_limits_whichever_comes_first(tmp_path: Path) -> None:
+    """The file-count cap still fires when it is reached before the byte cap."""
+    from scripts import split_for_indexing as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    for i in range(5):
+        _write(src / f"f{i:02d}.txt", 10)
+
+    # Generous byte limit, tight count limit -> count rule wins.
+    assert mod.main(
+        [str(src), str(dst), "--batch-size", "2", "--batch-bytes", "1000000"]
+    ) == 0
+    batches = sorted((dst / "BATCHES").glob("*.zip"))
+    assert [len(_list_zip(b)) for b in batches] == [2, 2, 1]
+
+
 # --- pre-flight --------------------------------------------------------------
 
 
@@ -312,3 +362,58 @@ def test_arcname_is_basename_only(tmp_path: Path) -> None:
         for info in zf.infolist():
             assert info.filename == "shallow.txt"
             assert "/" not in info.filename
+
+
+# --- run-log -----------------------------------------------------------------
+
+
+def test_runlog_records_each_file_with_bucket(tmp_path: Path) -> None:
+    from scripts import split_for_indexing as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "note.txt", 10)
+    _write(src / "photo.jpg", 10)
+    _write(src / "weird.xyz", 10)
+
+    assert mod.main([str(src), str(dst)]) == 0
+    by_input = {it["input"]: it for it in _runlog_items(dst)}
+    assert by_input["note.txt"]["kind"] == "BATCHES"
+    assert by_input["photo.jpg"]["kind"] == "TO_PDF"
+    assert by_input["weird.xyz"]["kind"] == "OTHER_EXTENSIONS"
+    assert {it["status"] for it in by_input.values()} == {"ok"}
+
+
+def test_copy_failure_recorded_as_fail(tmp_path: Path, monkeypatch) -> None:
+    from scripts import split_for_indexing as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "good.jpg", 10)
+    _write(src / "bad.jpg", 10)
+
+    real = mod.shutil.copy2
+
+    def flaky(s, d, *a, **k):
+        if Path(s).name == "bad.jpg":
+            raise PermissionError("denied")
+        return real(s, d, *a, **k)
+
+    monkeypatch.setattr(mod.shutil, "copy2", flaky)
+
+    mod.main([str(src), str(dst)])
+    by_input = {it["input"]: it for it in _runlog_items(dst)}
+    assert by_input["good.jpg"]["status"] == "ok"
+    assert by_input["bad.jpg"]["status"] == "fail"
+    assert by_input["bad.jpg"]["error_type"] == "PermissionError"
+
+
+def test_no_runlog_flag(tmp_path: Path) -> None:
+    from scripts import split_for_indexing as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    _write(src / "note.txt", 10)
+
+    assert mod.main([str(src), str(dst), "--no-runlog"]) == 0
+    assert not (dst / "_runlogs").exists()

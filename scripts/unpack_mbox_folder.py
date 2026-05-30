@@ -30,6 +30,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from mbox_handling.unpack import ensure_unpacked  # noqa: E402
+from scripts._runlog import RunLog  # noqa: E402
+from scripts import _runlog  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,19 +60,41 @@ def main(argv: list[str] | None = None) -> int:
         f"Found {len(mboxes)} mbox file(s) under {src}",
         file=sys.stderr,
     )
+    rl = RunLog(
+        "unpack_mbox_folder",
+        input_root=src,
+        output_root=dst,
+        argv=argv if argv is not None else sys.argv[1:],
+        log_dir=args.log_dir,
+        force=args.force,
+        enabled=not args.no_runlog,
+    )
     succeeded = 0
+    skipped = 0
     failed = 0
     used_names: set[str] = set()
     started = time.monotonic()
 
     total = len(mboxes)
     for i, mbox in enumerate(mboxes, start=1):
-        target = _pick_target(dst, mbox.stem, used_names)
+        rel = mbox.relative_to(src)
+        # Idempotent re-run: skip an mbox already unpacked into a still-present
+        # output dir. Reserve that dir's name so a different mbox can't pick it.
+        if (done := rl.done_output(mbox)) is not None:
+            skipped += 1
+            used_names.add(done.name)
+            print(f"[{i}/{total}] skip (done) {rel}", file=sys.stderr)
+            rl.record(mbox, kind="mbox", output=done, status="skip")
+            continue
+        # Reuse the prior target when reprocessing (force / changed) so we
+        # don't mint a fresh `<stem>-N/` next to the old one (bug #3).
+        target = rl.planned_output(mbox) or _pick_target(dst, mbox.stem, used_names)
         used_names.add(target.name)
         print(
-            f"[{i}/{total}] unpacking {mbox.relative_to(src)} -> {target.name}",
+            f"[{i}/{total}] unpacking {rel} -> {target.name}",
             file=sys.stderr,
         )
+        item_started = time.monotonic()
         try:
             ensure_unpacked(mbox, target=target)
         except Exception as exc:  # noqa: BLE001 — per-file isolation by design
@@ -79,16 +103,24 @@ def main(argv: list[str] | None = None) -> int:
                 f"error: failed to unpack {mbox}: {exc}",
                 file=sys.stderr,
             )
+            # Record the intended target so a retry reuses it instead of
+            # allocating a fresh `-N` dir.
+            rl.record(mbox, kind="mbox", output=target, status="fail", error=exc)
             continue
         succeeded += 1
+        rl.record(mbox, kind="mbox", output=target, status="ok",
+                  duration_s=round(time.monotonic() - item_started, 3))
 
     elapsed = time.monotonic() - started
+    skipped_part = f", {skipped} skipped" if skipped else ""
     print(
         f"Processed {total} mbox file(s) in {elapsed:.1f}s: "
-        f"{succeeded} succeeded, {failed} failed.",
+        f"{succeeded} succeeded, {failed} failed{skipped_part}.",
         file=sys.stderr,
     )
-    return 0 if failed == 0 else 1
+    exit_code = 0 if failed == 0 else 1
+    rl.finish(exit_code=exit_code)
+    return exit_code
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -103,6 +135,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "output_folder",
         help="Folder to write per-mbox unpacked trees into",
     )
+    _runlog.add_args(parser)
     return parser.parse_args(argv)
 
 
