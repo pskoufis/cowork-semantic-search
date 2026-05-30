@@ -35,12 +35,32 @@ class ParsedMessage:
     attachments: Tuple[ParsedAttachment, ...]
 
 
+# Best-effort fallbacks tried only after the normal parse fails. Each entry is
+# a set of ``openMsg`` options:
+#   * ``overrideEncoding="cp1252"`` rescues files whose code page is
+#     mis-detected (e.g. extract-msg guessing ``euc_kr``) or unmapped
+#     ("unknown encoding"), common in Western-European corpora.
+#   * ``strict=False`` additionally bypasses message-class detection, recovering
+#     files whose class type is stored 8-bit but flagged as Unicode (the garbled
+#     "Could not recognize MSG class type" case).
+_FALLBACK_OPEN_KWARGS = (
+    {"overrideEncoding": "cp1252"},
+    {"strict": False, "overrideEncoding": "cp1252"},
+)
+
+
 def read_message(msg_path: Path) -> ParsedMessage:
     """Parse a .msg file into a ``ParsedMessage``.
 
     The ``extract_msg`` dependency is imported lazily — missing-package errors
     surface with a friendly install hint, mirroring the .pst path in
     ``server.parsers._extract_pst``.
+
+    If the normal parse fails (malformed class type, mis-detected code page),
+    a best-effort retry is attempted with lenient options. A recovered result
+    is accepted only when it yields some text, so a genuinely-corrupt file still
+    surfaces as a failure (raising the *original* error) rather than a silent
+    empty success.
     """
     try:
         import extract_msg
@@ -51,8 +71,26 @@ def read_message(msg_path: Path) -> ParsedMessage:
             "pip install 'cowork-semantic-search[msg]'"
         ) from exc
 
+    try:
+        return _read_with(extract_msg, AttachmentType, msg_path)
+    except Exception as first_exc:  # noqa: BLE001 — best-effort recovery follows
+        for open_kwargs in _FALLBACK_OPEN_KWARGS:
+            try:
+                recovered = _read_with(
+                    extract_msg, AttachmentType, msg_path, **open_kwargs
+                )
+            except Exception:  # noqa: BLE001 — try the next strategy
+                continue
+            if _has_text(recovered):
+                return recovered
+        raise first_exc
+
+
+def _read_with(extract_msg, AttachmentType, msg_path: Path, **open_kwargs) -> ParsedMessage:
+    """Open and read a .msg with the given ``openMsg`` options into a
+    ``ParsedMessage``. Shared by the normal parse and every fallback strategy."""
     attachments: list[ParsedAttachment] = []
-    with extract_msg.openMsg(str(msg_path)) as msg:
+    with extract_msg.openMsg(str(msg_path), **open_kwargs) as msg:
         for att in msg.attachments:
             parsed = _parse_attachment(att, AttachmentType)
             if parsed is not None:
@@ -68,6 +106,11 @@ def read_message(msg_path: Path) -> ParsedMessage:
             body=_select_body(msg),
             attachments=tuple(attachments),
         )
+
+
+def _has_text(parsed: ParsedMessage) -> bool:
+    """True when a parse recovered some usable text (body or subject)."""
+    return bool(parsed.body.strip() or parsed.subject.strip())
 
 
 def _extract_date(msg) -> str:
