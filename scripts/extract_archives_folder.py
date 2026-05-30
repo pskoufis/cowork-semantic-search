@@ -50,6 +50,8 @@ if str(_REPO_ROOT) not in sys.path:
 from mbox_handling.unpack import ensure_unpacked as _unpack_mbox  # noqa: E402
 from msg_handling.unpack import ensure_unpacked as _unpack_msg  # noqa: E402
 from pst_handling.unpack import ensure_unpacked as _unpack_pst  # noqa: E402
+from scripts._runlog import RunLog  # noqa: E402
+from scripts import _runlog  # noqa: E402
 
 # Suffix (lowercased) -> archive kind. Order is irrelevant; lookup is by suffix.
 _KINDS = {".mbox": "mbox", ".pst": "pst", ".msg": "msg", ".zip": "zip",
@@ -84,16 +86,37 @@ def main(argv: list[str] | None = None) -> int:
         dst.mkdir(parents=True, exist_ok=True)
 
     return _run(src, dst, dry_run=args.dry_run, max_depth=args.max_depth,
-                copy_others=args.copy_others)
+                copy_others=args.copy_others, argv=argv,
+                log_dir=args.log_dir, force=args.force,
+                runlog_enabled=not args.no_runlog)
 
 
 def _run(src: Path, dst: Path, *, dry_run: bool, max_depth: int,
-         copy_others: bool = False) -> int:
+         copy_others: bool = False, argv: list[str] | None = None,
+         log_dir: str | None = None, force: bool = False,
+         runlog_enabled: bool = True) -> int:
     processed: set[Path] = set()
     counts = {"mbox": 0, "pst": 0, "msg": 0, "zip": 0}
     failed = 0
+    skipped = 0
     copied = 0
     started = time.monotonic()
+
+    # A run-log is pointless for a dry run (nothing is written). Otherwise it
+    # records per-archive status and drives the idempotent re-run.
+    rl = RunLog(
+        "extract_archives_folder",
+        input_root=src,
+        output_root=dst,
+        argv=argv if argv is not None else sys.argv[1:],
+        log_dir=log_dir,
+        force=force,
+        enabled=runlog_enabled and not dry_run,
+    )
+
+    # Surface multi-volume .rar sets whose first volume is missing — otherwise
+    # the secondary volumes are silently skipped and nothing is extracted.
+    _warn_orphan_secondary_rars(src)
 
     # With --copy-others, mirror every non-archive file from the input tree
     # into the output so the result is a complete index-ready mirror. Only
@@ -126,14 +149,32 @@ def _run(src: Path, dst: Path, *, dry_run: bool, max_depth: int,
                       file=sys.stderr)
                 counts[kind] += 1
                 continue
+            # Idempotent re-run: skip an archive already extracted (output
+            # present, source unchanged). The ledger is loaded once before the
+            # loop, so a nested archive freshly revealed *this* run is never
+            # mistaken for done.
+            if (done := rl.done_output(path)) is not None:
+                skipped += 1
+                print(f"[depth {depth}] skip (done) {kind}: {rel}",
+                      file=sys.stderr)
+                rl.record(path, kind=kind, output=done, status="skip")
+                continue
+            item_started = time.monotonic()
             try:
                 _process(path, kind, target)
             except Exception as exc:  # noqa: BLE001 — per-file isolation
                 failed += 1
                 print(f"error: failed to extract {path}: {exc}",
                       file=sys.stderr)
+                _cleanup_partial(kind, target, dst)
+                # output=None: the partial was cleaned up, so a re-run recomputes
+                # the deterministic target and retries.
+                rl.record(path, kind=kind, output=None, status="fail", error=exc)
                 continue
             counts[kind] += 1
+            rl.record(path, kind=kind, output=_record_output(kind, target, path),
+                      status="ok",
+                      duration_s=round(time.monotonic() - item_started, 3))
     else:
         # Loop exhausted max_depth without a clean break.
         if _remaining(dst, processed):
@@ -145,15 +186,72 @@ def _run(src: Path, dst: Path, *, dry_run: bool, max_depth: int,
 
     elapsed = time.monotonic() - started
     copied_part = f" {copied} other file(s) copied;" if copy_others else ""
+    skipped_part = f" {skipped} skipped;" if skipped else ""
     print(
         f"Done in {elapsed:.1f}s: "
         f"{counts['zip']} zip, {counts['mbox']} mbox, "
         f"{counts['pst']} pst, {counts['msg']} msg extracted;"
-        f"{copied_part} "
+        f"{copied_part}{skipped_part} "
         f"{failed} failed.",
         file=sys.stderr,
     )
-    return 0 if failed == 0 else 1
+    exit_code = 0 if failed == 0 else 1
+    rl.finish(exit_code=exit_code)
+    return exit_code
+
+
+def _record_output(kind: str, target: Path, path: Path) -> Path:
+    """The output path to record for the ledger. For ``msg`` the target is the
+    shared parent dir, so the meaningful per-input output is its ``.txt``."""
+    if kind == "msg":
+        return target / f"{path.stem}.txt"
+    return target
+
+
+def _cleanup_partial(kind: str, target: Path, dst: Path) -> None:
+    """Remove a partially-written extraction so a re-run starts clean.
+
+    Only dedicated output dirs (zip/rar/mbox/pst) are removed. A ``msg`` writes
+    into a *shared* parent directory alongside sibling messages, so its target
+    must never be deleted. Mirrors ``extract_zips.py``'s cleanup-on-failure;
+    note that re-extracting a *changed* archive in place means a mid-way failure
+    also drops the prior good extraction — acceptable, same as that script.
+    """
+    if kind == "msg":
+        return
+    try:
+        if _is_inside(target, dst) and target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _warn_orphan_secondary_rars(root: Path) -> None:
+    """Warn for any multi-volume ``.rar`` set under ``root`` whose first volume
+    is absent — its secondary ``.partN.rar`` (N>1) volumes are skipped by
+    discovery, so without this the whole set is silently missed.
+
+    Volumes are grouped by their base name (the part before ``.part``); a group
+    whose lowest volume number is >1 is missing its first volume.
+    """
+    if not root.exists():
+        return
+    groups: dict[Path, list[int]] = {}
+    for p in root.rglob("*"):
+        if not p.is_file() or _is_macos_junk(p):
+            continue
+        m = _RAR_SECONDARY_VOLUME.search(p.name)
+        if m is None:
+            continue
+        base = p.parent / p.name[: p.name.lower().index(".part")]
+        groups.setdefault(base, []).append(int(m.group(1)))
+    for base, numbers in sorted(groups.items()):
+        if min(numbers) > 1:
+            print(
+                f"warning: multi-volume rar set {base.name!r} is missing its "
+                "first volume; the set will not be extracted.",
+                file=sys.stderr,
+            )
 
 
 def _process(path: Path, kind: str, target: Path) -> None:
@@ -224,8 +322,10 @@ def _extract_zip(zip_path: Path, target: Path) -> None:
                 dest.mkdir(parents=True, exist_ok=True)
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
+            # Stream rather than read the whole member into memory — a large
+            # entry would otherwise spike RAM (bug #5).
             with zf.open(member) as srcf, open(dest, "wb") as outf:
-                outf.write(srcf.read())
+                shutil.copyfileobj(srcf, outf)
 
 
 def _extract_rar(rar_path: Path, target: Path) -> None:
@@ -262,7 +362,7 @@ def _extract_rar(rar_path: Path, target: Path) -> None:
                     continue
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with rf.open(member) as srcf, open(dest, "wb") as outf:
-                    outf.write(srcf.read())
+                    shutil.copyfileobj(srcf, outf)
     except rarfile.RarCannotExec as exc:  # no usable backend tool
         raise RuntimeError(
             "rarfile found no usable backend; install one, "
@@ -382,6 +482,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Maximum recursion passes (backstop against self-similar "
              "archives). Default: 10.",
     )
+    _runlog.add_args(parser)
     return parser.parse_args(argv)
 
 
