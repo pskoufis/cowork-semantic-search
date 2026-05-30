@@ -405,8 +405,27 @@ def test_force_reprocesses_everything(tmp_path: Path) -> None:
 
     assert main([str(src), str(dst)]) == 0
     assert main([str(src), str(dst), "--force"]) == 0
-    # With --force the second run re-copies rather than skipping.
+    # With --force the second run re-copies rather than skipping ...
     assert {it["status"] for it in _runlog_items(dst)} == {"ok"}
+    # ... but overwrites in place — no a_1.txt duplicate.
+    assert sorted(_files_only(dst)) == ["a.txt"]
+
+
+def test_edited_source_reprocesses_in_place(tmp_path: Path) -> None:
+    """Editing a source file invalidates the skip; the re-copy overwrites the
+    same destination rather than creating a_1.txt."""
+    from scripts.flatten_copy import main
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    f = _write(src / "a.txt", "v1")
+
+    assert main([str(src), str(dst)]) == 0
+    f.write_text("v2 longer body")  # changes mtime + size
+
+    assert main([str(src), str(dst)]) == 0
+    assert sorted(_files_only(dst)) == ["a.txt"]  # no duplicate
+    assert (dst / "a.txt").read_text() == "v2 longer body"
 
 
 def test_no_runlog_flag_writes_no_log(tmp_path: Path) -> None:

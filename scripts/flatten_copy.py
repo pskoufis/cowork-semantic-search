@@ -81,7 +81,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{i}/{total}] skip (done) {rel}", file=sys.stderr)
             rl.record(src_file, kind="file", output=done, status="skip")
             continue
-        dst_name = _pick_dst_name(src_file.name, dst, used_names)
+        # Reuse the prior destination when reprocessing a known input (--force,
+        # or an edited source) so we overwrite in place instead of minting an
+        # `a_1.txt` duplicate. New inputs (ledger empty for them) still get
+        # collision-suffixed against existing names.
+        planned = rl.planned_output(src_file)
+        dst_name = (
+            planned.name if planned is not None
+            else _pick_dst_name(src_file.name, dst, used_names)
+        )
         used_names.add(dst_name)
         print(f"[{i}/{total}] copying {rel} -> {dst_name}", file=sys.stderr)
         item_started = time.monotonic()

@@ -243,7 +243,10 @@ def _warn_orphan_secondary_rars(root: Path) -> None:
         m = _RAR_SECONDARY_VOLUME.search(p.name)
         if m is None:
             continue
-        base = p.parent / p.name[: p.name.lower().index(".part")]
+        # Slice at the matched ``.partN.rar`` position so a base name that
+        # itself contains ``.part`` (e.g. ``spare.parts.part2.rar``) groups
+        # correctly.
+        base = p.parent / p.name[: m.start()]
         groups.setdefault(base, []).append(int(m.group(1)))
     for base, numbers in sorted(groups.items()):
         if min(numbers) > 1:
