@@ -21,11 +21,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import sys
 from pathlib import Path
 
 from msg_handling.messages import ParsedMessage, read_message
+
+# Filesystem NAME_MAX is 255 bytes on the common targets (APFS, exFAT, ext4).
+# Nested .msg recursion compounds attachment names (``a__b__c…``), which can
+# blow past this and raise ENAMETOOLONG, so output filenames are capped.
+_MAX_BASENAME_BYTES = 255
 
 
 def ensure_unpacked(msg_path: Path, target: Path | None = None) -> Path:
@@ -109,7 +115,7 @@ def _write_outputs(parent: Path, stem: str, parsed: ParsedMessage) -> None:
             safe_name = _safe_basename(att.filename)
             if not safe_name:
                 continue
-            out = attachments_dir / f"{stem}__{safe_name}"
+            out = attachments_dir / _attachment_disk_name(stem, safe_name)
             out.write_bytes(att.data)
             attachment_rels.append(f"attachments/{out.name}")
 
@@ -127,7 +133,7 @@ def _recurse_into_nested(parent: Path, stem: str, parsed: ParsedMessage) -> None
         safe_name = _safe_basename(att.filename)
         if not safe_name:
             continue
-        inner = parent / "attachments" / f"{stem}__{safe_name}"
+        inner = parent / "attachments" / _attachment_disk_name(stem, safe_name)
         if not inner.is_file():
             continue
         try:
@@ -154,6 +160,37 @@ def _safe_basename(name: str) -> str:
     base = Path(name).name
     base = re.sub(r"[\\/]+", "_", base)
     return base.strip()
+
+
+def _attachment_disk_name(stem: str, safe_name: str) -> str:
+    """Build the on-disk attachment filename ``<stem>__<safe_name>``, capped to
+    a filesystem-safe byte length.
+
+    Short names pass through unchanged. When the combined name would exceed
+    ``_MAX_BASENAME_BYTES`` (e.g. deep nested-.msg recursion compounding
+    ``a__b__c…``), the extension is preserved and a short hash of the full name
+    is appended for uniqueness, with the rest truncated to fit. Both the writer
+    and the nested-recursion path call this, so the name they compute always
+    matches the file on disk. Capping at each level also keeps the next
+    recursion level's stem bounded.
+    """
+    full = f"{stem}__{safe_name}"
+    if len(full.encode("utf-8")) <= _MAX_BASENAME_BYTES:
+        return full
+    ext = Path(safe_name).suffix
+    if len(ext.encode("utf-8")) > 16:  # absurdly long "extension" — treat as none
+        ext = ""
+    digest = hashlib.sha1(full.encode("utf-8")).hexdigest()[:8]
+    suffix = f".{digest}{ext}"
+    head = full[: len(full) - len(ext)] if ext else full
+    budget = _MAX_BASENAME_BYTES - len(suffix.encode("utf-8"))
+    return _truncate_to_bytes(head, budget) + suffix
+
+
+def _truncate_to_bytes(text: str, max_bytes: int) -> str:
+    """Truncate ``text`` so its UTF-8 encoding is at most ``max_bytes``, without
+    splitting a multibyte character."""
+    return text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
 
 
 def _format_message_text(parsed: ParsedMessage, attachment_rels: list[str]) -> str:

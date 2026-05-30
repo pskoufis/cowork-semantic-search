@@ -156,6 +156,55 @@ def test_unpack_reextracts_when_msg_newer(tmp_path: Path, monkeypatch) -> None:
     assert "second" in (tmp_path / "foo.txt").read_text(encoding="utf-8")
 
 
+def test_long_attachment_name_is_capped(tmp_path: Path, monkeypatch) -> None:
+    """An over-long attachment name (which would blow past NAME_MAX and raise
+    ENAMETOOLONG when written) is capped to a filesystem-safe length, keeping
+    the extension, so the unpack succeeds instead of aborting the .msg."""
+    from msg_handling.unpack import ensure_unpacked
+
+    msg = tmp_path / "m.msg"
+    _touch_msg(msg)
+    long_name = "x" * 400 + ".pdf"
+    _install_reader(
+        monkeypatch,
+        lambda p: _msg(body="hi", attachments=(_att(long_name, b"DATA"),)),
+    )
+
+    ensure_unpacked(msg)  # must not raise OSError(ENAMETOOLONG)
+
+    att_dir = tmp_path / "attachments"
+    files = [p for p in att_dir.iterdir() if p.is_file()]
+    assert len(files) == 1
+    name = files[0].name
+    assert len(name.encode("utf-8")) <= 255
+    assert name.endswith(".pdf")
+    assert files[0].read_bytes() == b"DATA"
+    # The .txt was still produced and references the capped attachment name.
+    txt = (tmp_path / "m.txt").read_text(encoding="utf-8")
+    assert name in txt
+
+
+def test_distinct_long_names_do_not_collide(tmp_path: Path, monkeypatch) -> None:
+    """Two different over-long attachment names must cap to distinct on-disk
+    names (a uniqueness hash), not silently overwrite each other."""
+    from msg_handling.unpack import ensure_unpacked
+
+    msg = tmp_path / "m.msg"
+    _touch_msg(msg)
+    a = "a" * 400 + ".pdf"
+    b = "b" * 400 + ".pdf"
+    _install_reader(
+        monkeypatch,
+        lambda p: _msg(attachments=(_att(a, b"AAA"), _att(b, b"BBB"))),
+    )
+
+    ensure_unpacked(msg)
+
+    att_dir = tmp_path / "attachments"
+    payloads = sorted(p.read_bytes() for p in att_dir.iterdir() if p.is_file())
+    assert payloads == [b"AAA", b"BBB"]  # both survived, no clobber
+
+
 def test_two_msgs_share_one_attachments_folder(tmp_path: Path, monkeypatch) -> None:
     from msg_handling.unpack import ensure_unpacked
 

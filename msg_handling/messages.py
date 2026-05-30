@@ -35,12 +35,45 @@ class ParsedMessage:
     attachments: Tuple[ParsedAttachment, ...]
 
 
+# Best-effort openers tried in order, only after the normal parse fails. Each
+# takes ``(extract_msg, path)`` and returns a context-managed message object:
+#   1. ``openMsg(overrideEncoding="cp1252")`` rescues files whose code page is
+#      mis-detected (e.g. extract-msg guessing ``euc_kr``) or unmapped
+#      ("unknown encoding"), common in Western-European corpora.
+#   2. ``openMsg(strict=False, …)`` bypasses message-class detection (returns a
+#      bare file) for files whose class type is unrecognizable.
+#   3. ``Message(overrideEncoding="cp1252")`` constructs the full message reader
+#      *directly*, skipping class detection entirely — this is what recovers
+#      files whose class type is stored 8-bit but flagged Unicode (the garbled
+#      "Could not recognize MSG class type" case), where ``openMsg`` would only
+#      hand back a contentless base file.
+def _via_open_msg(**kwargs):
+    return lambda em, path: em.openMsg(str(path), **kwargs)
+
+
+def _via_message(**kwargs):
+    return lambda em, path: em.Message(str(path), **kwargs)
+
+
+_FALLBACK_OPENERS = (
+    _via_open_msg(overrideEncoding="cp1252"),
+    _via_open_msg(strict=False, overrideEncoding="cp1252"),
+    _via_message(overrideEncoding="cp1252"),
+)
+
+
 def read_message(msg_path: Path) -> ParsedMessage:
     """Parse a .msg file into a ``ParsedMessage``.
 
     The ``extract_msg`` dependency is imported lazily — missing-package errors
     surface with a friendly install hint, mirroring the .pst path in
     ``server.parsers._extract_pst``.
+
+    If the normal parse fails (malformed class type, mis-detected code page),
+    a best-effort retry is attempted with lenient options. A recovered result
+    is accepted only when it yields some text, so a genuinely-corrupt file still
+    surfaces as a failure (raising the *original* error) rather than a silent
+    empty success.
     """
     try:
         import extract_msg
@@ -51,8 +84,24 @@ def read_message(msg_path: Path) -> ParsedMessage:
             "pip install 'cowork-semantic-search[msg]'"
         ) from exc
 
+    try:
+        return _read_with(extract_msg, AttachmentType, msg_path, _via_open_msg())
+    except Exception as first_exc:  # noqa: BLE001 — best-effort recovery follows
+        for opener in _FALLBACK_OPENERS:
+            try:
+                recovered = _read_with(extract_msg, AttachmentType, msg_path, opener)
+            except Exception:  # noqa: BLE001 — try the next strategy
+                continue
+            if _has_text(recovered):
+                return recovered
+        raise first_exc
+
+
+def _read_with(extract_msg, AttachmentType, msg_path: Path, opener) -> ParsedMessage:
+    """Open and read a .msg with the given ``opener`` into a ``ParsedMessage``.
+    Shared by the normal parse and every fallback strategy."""
     attachments: list[ParsedAttachment] = []
-    with extract_msg.openMsg(str(msg_path)) as msg:
+    with opener(extract_msg, msg_path) as msg:
         for att in msg.attachments:
             parsed = _parse_attachment(att, AttachmentType)
             if parsed is not None:
@@ -68,6 +117,11 @@ def read_message(msg_path: Path) -> ParsedMessage:
             body=_select_body(msg),
             attachments=tuple(attachments),
         )
+
+
+def _has_text(parsed: ParsedMessage) -> bool:
+    """True when a parse recovered some usable text (body or subject)."""
+    return bool(parsed.body.strip() or parsed.subject.strip())
 
 
 def _extract_date(msg) -> str:
