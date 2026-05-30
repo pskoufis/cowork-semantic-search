@@ -9,7 +9,9 @@ Each file is copied (not moved) into one of four buckets under
 
 * ``BATCHES/`` — text-like (.txt .htm .html .rtf) up to 20 MiB and
   document-like (.pdf .doc .docx .eml .msg .wpd) up to 500 MiB are
-  written into 10K-file ``batch_NNN.zip`` archives.
+  written into ``batch_NNN.zip`` archives. A new batch is started every
+  10K files or every 1 GiB of input, whichever comes first
+  (``--batch-size`` / ``--batch-bytes``).
 * ``TOO_LARGE/`` — files of those extensions that exceed the size cap.
 * ``TO_PDF/`` — image extensions (jpg/jpeg/png/tif/tiff/bmp/gif/heic/
   heif/webp/jp2) regardless of size.
@@ -40,6 +42,7 @@ from scripts._runlog import RunLog  # noqa: E402
 from scripts import _runlog  # noqa: E402
 
 MIB = 1024 * 1024
+GIB = 1024 * MIB
 TEXT_LIMIT = 20 * MIB
 DOC_LIMIT = 500 * MIB
 
@@ -65,6 +68,7 @@ TO_PDF = "TO_PDF"
 OTHER = "OTHER_EXTENSIONS"
 
 DEFAULT_BATCH_SIZE = 10_000
+DEFAULT_BATCH_BYTES = 1 * GIB
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     bytes_per_bucket = {BATCHES: 0, TOO_LARGE: 0, TO_PDF: 0, OTHER: 0}
 
     progress = _make_progress()
-    writer = _BatchWriter(dst / BATCHES, args.batch_size)
+    writer = _BatchWriter(dst / BATCHES, args.batch_size, args.batch_bytes)
     interrupted = False
 
     try:
@@ -124,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
                 bucket = _classify(entry.name, size)
                 try:
                     if bucket is BATCHES:
-                        writer.add(entry.path, entry.name)
+                        writer.add(entry.path, entry.name, size)
                         out = dst / BATCHES / (writer.current_name() or "")
                     else:
                         out = dst / bucket / entry.name
@@ -164,21 +168,37 @@ def _classify(name: str, size: int) -> str:
 
 
 class _BatchWriter:
-    """Lazy 10K-per-zip writer rolling batch_001.zip, batch_002.zip, ..."""
+    """Lazy per-zip writer rolling batch_001.zip, batch_002.zip, ...
 
-    def __init__(self, batches_dir: Path, batch_size: int) -> None:
+    A new batch is started whenever the current one reaches ``batch_size``
+    files **or** adding the next file would push its accumulated (uncompressed)
+    input bytes past ``batch_bytes`` — whichever comes first.
+    """
+
+    def __init__(self, batches_dir: Path, batch_size: int, batch_bytes: int) -> None:
         self._dir = batches_dir
         self._batch_size = batch_size
+        self._batch_bytes = batch_bytes
         self._index = 0
         self._files_in_current = 0
+        self._bytes_in_current = 0
         self._zf: zipfile.ZipFile | None = None
 
-    def add(self, src_path: str, arcname: str) -> None:
-        if self._zf is None or self._files_in_current >= self._batch_size:
+    def add(self, src_path: str, arcname: str, size: int = 0) -> None:
+        # Roll on either cap. The byte check only fires when the current batch
+        # already holds something, so a single file larger than the byte limit
+        # still lands in a batch of its own rather than looping forever.
+        too_many = self._files_in_current >= self._batch_size
+        too_big = (
+            self._files_in_current > 0
+            and self._bytes_in_current + size > self._batch_bytes
+        )
+        if self._zf is None or too_many or too_big:
             self._roll()
         assert self._zf is not None
         self._zf.write(src_path, arcname=arcname)
         self._files_in_current += 1
+        self._bytes_in_current += size
 
     def close(self) -> None:
         if self._zf is not None:
@@ -198,6 +218,7 @@ class _BatchWriter:
             self._zf.close()
         self._index += 1
         self._files_in_current = 0
+        self._bytes_in_current = 0
         path = self._dir / f"batch_{self._index:03d}.zip"
         self._zf = zipfile.ZipFile(path, mode="w", compression=zipfile.ZIP_DEFLATED)
 
@@ -266,6 +287,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_BATCH_SIZE,
         help=f"Files per batch zip (default {DEFAULT_BATCH_SIZE}).",
+    )
+    parser.add_argument(
+        "--batch-bytes",
+        type=int,
+        default=DEFAULT_BATCH_BYTES,
+        help="Roll a new batch zip once its accumulated (uncompressed) input "
+        f"bytes would exceed this many bytes (default {DEFAULT_BATCH_BYTES} = "
+        "1 GiB). Whichever of --batch-size / --batch-bytes is hit first wins.",
     )
     # One-shot bucketing (output must be empty); no ledger skipping, so --force
     # is omitted.

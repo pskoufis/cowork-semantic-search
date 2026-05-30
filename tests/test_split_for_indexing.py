@@ -273,6 +273,44 @@ def test_batches_roll_at_configured_size(tmp_path: Path) -> None:
     assert sorted(all_names) == [f"f{i:02d}.txt" for i in range(7)]
 
 
+def test_batches_roll_at_byte_limit(tmp_path: Path) -> None:
+    """A batch also rolls when accumulated (uncompressed) input bytes would
+    exceed --batch-bytes, independent of the file count."""
+    from scripts import split_for_indexing as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    # Four 100-byte files, byte limit 250 -> two files per batch.
+    for i in range(4):
+        _write(src / f"f{i:02d}.txt", 100)
+
+    assert mod.main([str(src), str(dst), "--batch-bytes", "250"]) == 0
+
+    batches = sorted((dst / "BATCHES").glob("*.zip"))
+    assert [len(_list_zip(b)) for b in batches] == [2, 2]
+    all_names = []
+    for b in batches:
+        all_names.extend(_list_zip(b))
+    assert sorted(all_names) == [f"f{i:02d}.txt" for i in range(4)]
+
+
+def test_byte_and_count_limits_whichever_comes_first(tmp_path: Path) -> None:
+    """The file-count cap still fires when it is reached before the byte cap."""
+    from scripts import split_for_indexing as mod
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    for i in range(5):
+        _write(src / f"f{i:02d}.txt", 10)
+
+    # Generous byte limit, tight count limit -> count rule wins.
+    assert mod.main(
+        [str(src), str(dst), "--batch-size", "2", "--batch-bytes", "1000000"]
+    ) == 0
+    batches = sorted((dst / "BATCHES").glob("*.zip"))
+    assert [len(_list_zip(b)) for b in batches] == [2, 2, 1]
+
+
 # --- pre-flight --------------------------------------------------------------
 
 
