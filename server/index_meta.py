@@ -45,6 +45,38 @@ def write_meta(db_dir: str, profile: EmbeddingProfile, dim: int) -> None:
         json.dump(payload, fh, indent=2)
 
 
+# Row count at the last full IVF index build, merged into the same sidecar.
+# Used to decide when the corpus has grown enough to warrant a retrain.
+VECTOR_INDEX_ROWS_KEY = "vector_index_rows"
+
+
+def read_vector_index_rows(db_dir: str) -> int | None:
+    """Row count recorded at the last full IVF build, or None if never built."""
+    meta = read_meta(db_dir)
+    if not meta:
+        return None
+    value = meta.get(VECTOR_INDEX_ROWS_KEY)
+    return int(value) if value is not None else None
+
+
+def write_vector_index_rows(db_dir: str, n: int) -> None:
+    """Record the row count of the latest full IVF build, merging into the
+    existing model/dim sidecar.
+
+    No-op if no sidecar exists yet: the row count is a hint that lives
+    alongside the model/dim payload, and writing a standalone file without
+    those keys would leave a partial sidecar that every other reader treats as
+    authoritative. In the normal flow write_meta() has already run, so the
+    sidecar is present; a sidecar-less (legacy) index simply retrains each run.
+    """
+    meta = read_meta(db_dir)
+    if not meta:
+        return
+    meta[VECTOR_INDEX_ROWS_KEY] = int(n)
+    with open(_meta_path(db_dir), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2)
+
+
 def resolve_index_profile(
     db_dir: str,
     env_alias: str | None,

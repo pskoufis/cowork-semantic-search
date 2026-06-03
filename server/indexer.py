@@ -361,10 +361,14 @@ def _finalize_index(
 ) -> list[str]:
     """Post-indexing finalize step.
 
-    Compacts the table when anything was written — index content *or* just file
-    stats (a drive move refreshes stats without changing content). Rebuilds the
-    ANN and FTS indexes only when index content actually changed, so a pure
-    drive-move run does not trigger a needless 50GB index rebuild.
+    Runs only when something was written — index content *or* just file stats
+    (a drive move refreshes stats without changing content).
+
+    optimize_table() always runs: it compacts small fragments AND folds any
+    newly-added rows into the existing ANN/FTS indexes incrementally, so a
+    routine run never pays an O(n) index rebuild. The create_*_index steps then
+    build each index once (first time the table is large enough) and retrain the
+    IVF index only after substantial growth — they are no-ops on ordinary runs.
 
     Each step's error is captured as a warning, never raised — a finalize
     hiccup must not fail a multi-hour indexing run.
@@ -374,8 +378,8 @@ def _finalize_index(
     if content_changed or stats_changed:
         steps.append(("compaction", store.optimize_table))
     if content_changed:
-        steps.append(("vector index build", store.create_vector_index))
-        steps.append(("FTS index build", store.create_fts_index))
+        steps.append(("vector index maintenance", store.create_vector_index))
+        steps.append(("FTS index maintenance", store.create_fts_index))
     for label, fn in steps:
         try:
             fn()
