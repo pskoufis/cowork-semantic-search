@@ -65,3 +65,20 @@ def test_status_cold_start_does_not_crash(tmp_path, capsys):
     assert rc == 0
     captured = capsys.readouterr()
     assert "csemsearch index" in captured.out
+
+
+def test_cli_status_lists_each_index(tmp_path, monkeypatch, capsys):
+    import os as _os
+    from server.index_meta import write_meta
+    from server.embedding_models import resolve_profile
+    from cli.commands import status_cmd
+
+    a, b = str(tmp_path / "A"), str(tmp_path / "B")
+    write_meta(a, *resolve_profile("minilm", None))
+    write_meta(b, *resolve_profile("qwen3-0.6b", None))
+    monkeypatch.delenv("LANCEDB_PATH", raising=False)
+    monkeypatch.setenv("LANCEDB_PATHS", f"{a}{_os.pathsep}{b}")
+
+    status_cmd(db_path=None)  # None → fan out
+    out = capsys.readouterr().out
+    assert "minilm" in out and "qwen3-0.6b" in out
