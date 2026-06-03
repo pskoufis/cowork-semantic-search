@@ -4,7 +4,11 @@ recursing fully into archives revealed inside extracted zips.
 
 Usage:
     python scripts/extract_archives_folder.py <input-folder> <output-folder> \
-        [--dry-run] [--max-depth N]
+        [--dry-run] [--max-depth N] [--exclude SUBDIR ...]
+
+``--exclude`` (repeatable) skips a subfolder of the input tree entirely —
+nothing inside it is extracted or copied. Each value is a path relative to
+<input-folder> (e.g. ``--exclude Archive/Old``).
 
 This is a thin orchestrator: it delegates the per-type work to the
 existing libraries (``mbox_handling`` / ``msg_handling`` / ``pst_handling``
@@ -85,16 +89,22 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         dst.mkdir(parents=True, exist_ok=True)
 
+    excludes = _normalize_excludes(args.exclude, src)
+    if excludes:
+        print("Excluding subfolders: "
+              + ", ".join(str(p) for p in sorted(excludes)), file=sys.stderr)
+
     return _run(src, dst, dry_run=args.dry_run, max_depth=args.max_depth,
                 copy_others=args.copy_others, argv=argv,
                 log_dir=args.log_dir, force=args.force,
-                runlog_enabled=not args.no_runlog)
+                runlog_enabled=not args.no_runlog, excludes=excludes)
 
 
 def _run(src: Path, dst: Path, *, dry_run: bool, max_depth: int,
          copy_others: bool = False, argv: list[str] | None = None,
          log_dir: str | None = None, force: bool = False,
-         runlog_enabled: bool = True) -> int:
+         runlog_enabled: bool = True, excludes: set[Path] | None = None) -> int:
+    excludes = excludes or set()
     processed: set[Path] = set()
     counts = {"mbox": 0, "pst": 0, "msg": 0, "zip": 0}
     failed = 0
@@ -116,14 +126,15 @@ def _run(src: Path, dst: Path, *, dry_run: bool, max_depth: int,
 
     # Surface multi-volume .rar sets whose first volume is missing — otherwise
     # the secondary volumes are silently skipped and nothing is extracted.
-    _warn_orphan_secondary_rars(src)
+    _warn_orphan_secondary_rars(src, excludes=excludes)
 
     # With --copy-others, mirror every non-archive file from the input tree
     # into the output so the result is a complete index-ready mirror. Only
     # the input tree is copied: files revealed inside extracted zips already
     # live in the output tree.
     if copy_others:
-        copied, copy_failed = _copy_other_files(src, dst, dry_run=dry_run)
+        copied, copy_failed = _copy_other_files(src, dst, dry_run=dry_run,
+                                                excludes=excludes)
         failed += copy_failed
 
     # Pass 1 scans the input tree (target mirrors input). Every later pass
@@ -131,9 +142,13 @@ def _run(src: Path, dst: Path, *, dry_run: bool, max_depth: int,
     # processes them where they sit.
     for depth in range(1, max_depth + 1):
         scan_root = src if depth == 1 else dst
+        # Excludes are relative to the input tree, so they only bite on pass 1
+        # (scan_root == src). On later passes scan_root is the output tree, and
+        # excluded input subfolders were never extracted there, so there is
+        # nothing of theirs to re-discover.
         new = [
             (p, kind)
-            for p, kind in _discover(scan_root)
+            for p, kind in _discover(scan_root, excludes=excludes)
             if p not in processed
         ]
         if not new:
@@ -226,19 +241,24 @@ def _cleanup_partial(kind: str, target: Path, dst: Path) -> None:
         pass
 
 
-def _warn_orphan_secondary_rars(root: Path) -> None:
+def _warn_orphan_secondary_rars(root: Path,
+                                excludes: set[Path] | None = None) -> None:
     """Warn for any multi-volume ``.rar`` set under ``root`` whose first volume
     is absent — its secondary ``.partN.rar`` (N>1) volumes are skipped by
-    discovery, so without this the whole set is silently missed.
+    discovery, so without this the whole set is silently missed. Sets inside an
+    excluded subfolder are ignored (they are skipped on purpose).
 
     Volumes are grouped by their base name (the part before ``.part``); a group
     whose lowest volume number is >1 is missing its first volume.
     """
+    excludes = excludes or set()
     if not root.exists():
         return
     groups: dict[Path, list[int]] = {}
     for p in root.rglob("*"):
         if not p.is_file() or _is_macos_junk(p):
+            continue
+        if _is_excluded(p, root, excludes):
             continue
         m = _RAR_SECONDARY_VOLUME.search(p.name)
         if m is None:
@@ -373,12 +393,15 @@ def _extract_rar(rar_path: Path, target: Path) -> None:
         ) from exc
 
 
-def _copy_other_files(src: Path, dst: Path, *, dry_run: bool) -> tuple[int, int]:
+def _copy_other_files(src: Path, dst: Path, *, dry_run: bool,
+                      excludes: set[Path] | None = None) -> tuple[int, int]:
     """Copy every non-archive file under ``src`` into ``dst`` preserving the
-    relative path. Archive types (handled by extraction) are skipped. A
-    destination is overwritten only when the source is newer (mtime), so
-    re-runs are idempotent. Returns ``(copied, failed)``.
+    relative path. Archive types (handled by extraction) and files inside an
+    excluded subfolder are skipped. A destination is overwritten only when the
+    source is newer (mtime), so re-runs are idempotent. Returns
+    ``(copied, failed)``.
     """
+    excludes = excludes or set()
     copied = 0
     failed = 0
     for p in sorted(src.rglob("*")):
@@ -386,6 +409,8 @@ def _copy_other_files(src: Path, dst: Path, *, dry_run: bool) -> tuple[int, int]
             continue
         if _is_macos_junk(p):
             continue  # AppleDouble / .DS_Store / __MACOSX — never content
+        if _is_excluded(p, src, excludes):
+            continue
         if p.suffix.lower() in _KINDS:
             continue  # archives are extracted, not copied
         rel = p.relative_to(src)
@@ -407,10 +432,13 @@ def _copy_other_files(src: Path, dst: Path, *, dry_run: bool) -> tuple[int, int]
     return copied, failed
 
 
-def _discover(root: Path) -> list[tuple[Path, str]]:
+def _discover(root: Path,
+              excludes: set[Path] | None = None) -> list[tuple[Path, str]]:
     """All .mbox/.pst/.msg/.zip files under ``root`` (recursive, by suffix),
     paired with their kind. Skips anything that is not a regular file (so an
-    mbox-as-directory does not get treated as a file)."""
+    mbox-as-directory does not get treated as a file), and anything inside an
+    excluded subfolder (paths relative to ``root``)."""
+    excludes = excludes or set()
     found: list[tuple[Path, str]] = []
     if not root.exists():
         return found
@@ -419,6 +447,8 @@ def _discover(root: Path) -> list[tuple[Path, str]]:
             continue
         if _is_macos_junk(p):
             continue  # AppleDouble / .DS_Store / __MACOSX — not real archives
+        if _is_excluded(p, root, excludes):
+            continue
         kind = _KINDS.get(p.suffix.lower())
         if kind is None:
             continue
@@ -442,6 +472,41 @@ def _is_secondary_rar_volume(path: Path) -> bool:
     must not be opened directly (the first volume pulls in the whole set)."""
     m = _RAR_SECONDARY_VOLUME.search(path.name)
     return m is not None and int(m.group(1)) > 1
+
+
+def _normalize_excludes(raw: list[str], src: Path) -> set[Path]:
+    """Turn ``--exclude`` values into a set of directories relative to ``src``.
+
+    Each value is resolved against ``src``; one that does not exist, is not a
+    directory, or escapes the input tree is warned about and dropped. Returns
+    the surviving excludes as paths relative to ``src`` (so they can be matched
+    against ``rglob`` results that are also made relative to ``src``).
+    """
+    excludes: set[Path] = set()
+    for value in raw:
+        candidate = (src / value.strip().strip("/")).resolve()
+        if not _is_inside(candidate, src) or candidate == src:
+            print(f"warning: --exclude {value!r} is not under the input "
+                  "folder; ignored.", file=sys.stderr)
+            continue
+        if not candidate.is_dir():
+            print(f"warning: --exclude {value!r} not found under input; "
+                  "ignored.", file=sys.stderr)
+            continue
+        excludes.add(candidate.relative_to(src))
+    return excludes
+
+
+def _is_excluded(path: Path, root: Path, excludes: set[Path]) -> bool:
+    """True if ``path`` (somewhere under ``root``) lives inside any excluded
+    relative directory. Empty ``excludes`` → always False."""
+    if not excludes:
+        return False
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    return any(rel.is_relative_to(ex) for ex in excludes)
 
 
 def _remaining(root: Path, processed: set[Path]) -> bool:
@@ -473,6 +538,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Print planned extractions without writing anything.",
+    )
+    parser.add_argument(
+        "--exclude", action="append", default=[], metavar="DIR",
+        help="Subfolder (path relative to <input-folder>) to skip entirely. "
+             "Repeatable. Files inside an excluded subfolder are neither "
+             "extracted nor copied. Non-existent excludes are warned and "
+             "ignored.",
     )
     parser.add_argument(
         "--copy-others", action="store_true",
