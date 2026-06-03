@@ -86,12 +86,10 @@ def exceeds_size_cap(file_path: Path, size: int) -> bool:
     return size > MAX_FILE_SIZE_BYTES
 
 
-# Qwen3-Embedding-0.6B: 1024-dim native, MRL-supported. We truncate to
-# EMBEDDING_DIM (from store.py — currently 256) via Matryoshka — the head
-# dimensions are first-class, not a naive slice.
-EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-
-_model = None
+# SentenceTransformer instances cached by (model_id, dim). A process usually
+# touches one model, but search and a description-drain can both run with the
+# index's recorded model, so the cache keeps loads to one per distinct model.
+_model_cache: dict[tuple[str, int], object] = {}
 
 
 def _select_device() -> str:
@@ -109,29 +107,58 @@ def _select_device() -> str:
     return "cpu"
 
 
-def get_model():
-    global _model
-    if _model is None:
+def _model_load_kwargs(profile, dim: int) -> dict:
+    """sentence-transformers load kwargs derived from a profile.
+
+    MRL models truncate (and renormalise) to ``dim``; fixed-dim models load at
+    native width. Decoder models (Qwen) need left-padding so last-token pooling
+    never pools a PAD token for shorter sequences in a batch.
+    """
+    kwargs: dict = {"device": _select_device()}
+    if profile.mrl:
+        kwargs["truncate_dim"] = dim
+    if profile.padding_side is not None:
+        kwargs["tokenizer_kwargs"] = {"padding_side": profile.padding_side}
+    return kwargs
+
+
+def get_model(profile, dim: int):
+    """Load (and cache) the SentenceTransformer for a profile/dim."""
+    key = (profile.model_id, dim)
+    model = _model_cache.get(key)
+    if model is None:
         from sentence_transformers import SentenceTransformer
-        from server.store import EMBEDDING_DIM
-        _model = SentenceTransformer(
-            EMBEDDING_MODEL,
-            device=_select_device(),
-            # Matryoshka — sentence-transformers truncates *and* L2-renormalises.
-            truncate_dim=EMBEDDING_DIM,
-            # Qwen3 uses last-token pooling on a decoder; right-padding would
-            # make the pooled token a PAD for shorter sequences in a batch and
-            # silently corrupt embeddings.
-            tokenizer_kwargs={"padding_side": "left"},
+        model = SentenceTransformer(profile.model_id, **_model_load_kwargs(profile, dim))
+        # Fail loudly at load if a profile that relies on a built-in query
+        # prompt loads a model that doesn't expose it — better than dying on
+        # the first user query.
+        if profile.query_prompt_name is not None:
+            if profile.query_prompt_name not in getattr(model, "prompts", {}):
+                raise RuntimeError(
+                    f"{profile.model_id} did not expose a "
+                    f"{profile.query_prompt_name!r} prompt expected by its profile."
+                )
+        _model_cache[key] = model
+    return model
+
+
+def encode_documents(model, profile, texts: list[str]):
+    """Encode passages — no query prompt/prefix, normalised per profile."""
+    return model.encode(
+        texts, show_progress_bar=False, normalize_embeddings=profile.normalize,
+    )
+
+
+def encode_query(model, profile, query: str):
+    """Encode a single query, applying the profile's query prompt/prefix."""
+    if profile.query_prompt_name is not None:
+        return model.encode(
+            [query],
+            normalize_embeddings=profile.normalize,
+            prompt_name=profile.query_prompt_name,
         )
-        # Fail loudly at load if the model upload ever drops the "query" prompt
-        # we rely on in search.py — better than dying on first user query.
-        if "query" not in getattr(_model, "prompts", {}):
-            raise RuntimeError(
-                f"{EMBEDDING_MODEL} did not expose a 'query' prompt; "
-                "server/search.py relies on it. Check the model card / upload."
-            )
-    return _model
+    text = profile.query_prefix + query if profile.query_prefix is not None else query
+    return model.encode([text], normalize_embeddings=profile.normalize)
 
 
 def discover_files(
@@ -187,13 +214,24 @@ def compute_file_hash(file_path: Path) -> str:
     return h.hexdigest()
 
 
-def embed_chunks(chunks: list[dict]) -> list[dict]:
-    model = get_model()
+def _resolve_run_profile(db_dir: str, for_write: bool):
+    """Resolve (profile, dim) for a write run from EMBEDDING_MODEL/EMBEDDING_DIM
+    env vars reconciled against the index's recorded sidecar."""
+    from server.index_meta import resolve_index_profile
+    env_alias = os.environ.get("EMBEDDING_MODEL")
+    _env_dim_raw = os.environ.get("EMBEDDING_DIM")
+    env_dim = int(_env_dim_raw) if _env_dim_raw else None
+    return resolve_index_profile(
+        db_dir, env_alias=env_alias, env_dim=env_dim, for_write=for_write
+    )
+
+
+def embed_chunks(chunks: list[dict], model, profile) -> list[dict]:
     texts = [c["text"] for c in chunks]
     all_embeddings = []
     for i in range(0, len(texts), BATCH_SIZE):
         batch = texts[i:i + BATCH_SIZE]
-        embeddings = model.encode(batch, show_progress_bar=False, normalize_embeddings=True)
+        embeddings = encode_documents(model, profile, batch)
         all_embeddings.extend(embeddings)
     for chunk, embedding in zip(chunks, all_embeddings):
         chunk["vector"] = embedding.tolist()
@@ -267,8 +305,12 @@ def reindex_one_file(file_path: str, db_path: str | None = None) -> dict:
 
     source_rel = to_relative(str(path), db_dir)
 
-    store = VectorStore(db_dir)
+    profile, dim = _resolve_run_profile(db_dir, for_write=True)
+    store = VectorStore(db_dir, dim=dim)
     store.ensure_schema()
+    from server.index_meta import write_meta
+    write_meta(db_dir, profile, dim)
+    model = get_model(profile, dim)
     store.delete_by_file(source_rel)
 
     if path.suffix.lower() in SPREADSHEET_EXTENSIONS:
@@ -299,7 +341,7 @@ def reindex_one_file(file_path: str, db_path: str | None = None) -> dict:
     file_hash = compute_file_hash(path)
 
     if chunks:
-        chunks = embed_chunks(chunks)
+        chunks = embed_chunks(chunks, model, profile)
         for c in chunks:
             c["content_hash"] = file_hash
             c["mtime_ns"] = stat.st_mtime_ns
@@ -378,8 +420,14 @@ def index_folder(
     if unpack_first:
         run_unpack_passes(folder, recursive=recursive, exclusions=exclusions)
 
-    store = VectorStore(db_dir)
+    # Resolve the embedding model/dim for this run (env, reconciled against any
+    # existing index sidecar) and record it so search/status self-describe.
+    profile, dim = _resolve_run_profile(db_dir, for_write=True)
+    store = VectorStore(db_dir, dim=dim)
     store.ensure_schema()  # migrate older indexes in place, if needed
+    from server.index_meta import write_meta
+    write_meta(db_dir, profile, dim)
+    model = get_model(profile, dim)
     # One-shot eviction: drop any legacy CSV/XLSX text chunks so they're
     # re-processed via the description path on this run. The returned set
     # tells the per-file loop to bypass the content_hash short-circuit for
@@ -572,7 +620,7 @@ def index_folder(
             parts = extract_text(file_path)
             chunks = chunk_document(parts, source_rel)
             if chunks:
-                chunks = embed_chunks(chunks)
+                chunks = embed_chunks(chunks, model, profile)
                 for c in chunks:
                     c["content_hash"] = file_hash
                     c["mtime_ns"] = mtime_ns

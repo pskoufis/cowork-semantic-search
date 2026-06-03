@@ -7,31 +7,40 @@ from pathlib import Path
 import lancedb
 import pyarrow as pa
 
-# Single source of truth for the embedding dimension. Lives in store.py (not
-# indexer.py) because the schema's FixedSizeList width must match it, and
-# indexer.py already imports from this module — putting it here avoids a cycle.
+# Legacy/default embedding dimension. Indexes created before the
+# configurable-model change carry no index_meta.json and are assumed to be
+# this width; new indexes record their own dim in index_meta.json and a
+# VectorStore self-resolves to it. The schema's FixedSizeList width must match
+# whatever the index in question uses, so the schema is built per-dim below.
 EMBEDDING_DIM = 256
 
-SCHEMA = pa.schema([
-    pa.field("id", pa.string()),
-    pa.field("text", pa.string()),
-    pa.field("source_file", pa.string()),
-    pa.field("file_name", pa.string()),
-    pa.field("file_type", pa.string()),
-    pa.field("folder_path", pa.string()),
-    pa.field("chunk_index", pa.int32()),
-    pa.field("content_hash", pa.string()),
-    # st_mtime_ns + st_size — a cheap stat pre-check that avoids re-hashing
-    # unchanged files. int64 (not float st_mtime) for exact equality.
-    pa.field("mtime_ns", pa.int64()),
-    pa.field("file_size", pa.int64()),
-    # chunk_kind: "text" (default, NULL on legacy rows), "sheet_description",
-    # or "file_description". sheet_name is non-null only on sheet_description
-    # chunks. Both nullable so the in-place migration can backfill with NULL.
-    pa.field("chunk_kind", pa.string()),
-    pa.field("sheet_name", pa.string()),
-    pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
-])
+
+def make_schema(dim: int) -> pa.Schema:
+    """Build the chunks-table schema for a given vector width."""
+    return pa.schema([
+        pa.field("id", pa.string()),
+        pa.field("text", pa.string()),
+        pa.field("source_file", pa.string()),
+        pa.field("file_name", pa.string()),
+        pa.field("file_type", pa.string()),
+        pa.field("folder_path", pa.string()),
+        pa.field("chunk_index", pa.int32()),
+        pa.field("content_hash", pa.string()),
+        # st_mtime_ns + st_size — a cheap stat pre-check that avoids re-hashing
+        # unchanged files. int64 (not float st_mtime) for exact equality.
+        pa.field("mtime_ns", pa.int64()),
+        pa.field("file_size", pa.int64()),
+        # chunk_kind: "text" (default, NULL on legacy rows), "sheet_description",
+        # or "file_description". sheet_name is non-null only on sheet_description
+        # chunks. Both nullable so the in-place migration can backfill with NULL.
+        pa.field("chunk_kind", pa.string()),
+        pa.field("sheet_name", pa.string()),
+        pa.field("vector", pa.list_(pa.float32(), dim)),
+    ])
+
+
+# Legacy/default schema, kept for tests and any caller that imports SCHEMA.
+SCHEMA = make_schema(EMBEDDING_DIM)
 
 TABLE_NAME = "chunks"
 
@@ -70,10 +79,18 @@ def _escape(value: str) -> str:
 
 
 class VectorStore:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, dim: int | None = None):
         self._db_path = db_path
         self._db = lancedb.connect(db_path)
         self._table = None
+        if dim is None:
+            # Self-resolve from the index's sidecar; legacy indexes (no
+            # sidecar) fall back to the historical default width.
+            from server.index_meta import read_meta
+            meta = read_meta(db_path)
+            dim = int(meta["dim"]) if meta else EMBEDDING_DIM
+        self._dim = dim
+        self._schema = make_schema(dim)
 
     def _get_table(self):
         if self._table is None:
@@ -87,7 +104,7 @@ class VectorStore:
     def _ensure_table(self):
         table = self._get_table()
         if table is None:
-            self._table = self._db.create_table(TABLE_NAME, schema=SCHEMA)
+            self._table = self._db.create_table(TABLE_NAME, schema=self._schema)
         return self._table
 
     def _check_dim_compat(self, table) -> None:
@@ -101,12 +118,12 @@ class VectorStore:
             stored_dim = vector_field.type.list_size
         except Exception:
             return  # nothing we can do; let the underlying error surface
-        if stored_dim != EMBEDDING_DIM:
+        if stored_dim != self._dim:
             raise RuntimeError(
                 f"Index at {self._db_path!r} has {stored_dim}-dim vectors, "
-                f"but the current embedding model produces {EMBEDDING_DIM}-dim "
-                f"vectors. The model changed since this index was built. "
-                f"Delete {self._db_path!r} and re-index."
+                f"but the configured embedding model produces {self._dim}-dim "
+                f"vectors. The model/dim does not match this index. Use a "
+                f"different db-path or matching EMBEDDING_MODEL/EMBEDDING_DIM."
             )
 
     def ensure_schema(self) -> None:
@@ -284,7 +301,7 @@ class VectorStore:
             vector_column_name="vector",
             index_type="IVF_PQ",
             num_partitions=max(1, n // 4096),
-            num_sub_vectors=EMBEDDING_DIM // 8,  # IVF_PQ subspace count; 8 floats per sub-vector
+            num_sub_vectors=self._dim // 8,  # IVF_PQ subspace count; 8 floats per sub-vector
             replace=True,
         )
 
