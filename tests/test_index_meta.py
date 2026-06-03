@@ -1,6 +1,12 @@
 import pytest
 
-from server.index_meta import read_meta, write_meta, resolve_index_profile
+from server.index_meta import (
+    read_meta,
+    write_meta,
+    resolve_index_profile,
+    read_vector_index_rows,
+    write_vector_index_rows,
+)
 from server.embedding_models import resolve_profile
 
 
@@ -62,3 +68,32 @@ def test_resolve_new_index_uses_env(tmp_path):
     db = str(tmp_path / "idx")  # no meta yet
     profile, dim = resolve_index_profile(db, env_alias="minilm", env_dim=None, for_write=True)
     assert profile.alias == "minilm" and dim == 384
+
+
+def test_vector_index_rows_merges_without_clobbering_model_dim(tmp_path):
+    """Recording the IVF build row count must preserve the model/dim payload,
+    so the sidecar stays valid for every other reader."""
+    db = str(tmp_path / "idx")
+    profile, dim = resolve_profile("minilm", None)
+    write_meta(db, profile, dim)
+    write_vector_index_rows(db, 5000)
+    assert read_vector_index_rows(db) == 5000
+    meta = read_meta(db)
+    assert meta["model_alias"] == "minilm" and meta["dim"] == 384
+
+
+def test_vector_index_rows_no_sidecar_does_not_create_partial(tmp_path):
+    """Without an existing sidecar, recording a row count must NOT write a
+    partial file (no model/dim) — that would crash every authoritative reader."""
+    db = str(tmp_path / "idx")
+    write_vector_index_rows(db, 5000)
+    assert read_meta(db) is None
+    assert read_vector_index_rows(db) is None
+
+
+def test_read_vector_index_rows_absent_when_only_model_dim(tmp_path):
+    """A model/dim sidecar that predates row-count tracking reads back None."""
+    db = str(tmp_path / "idx")
+    profile, dim = resolve_profile("minilm", None)
+    write_meta(db, profile, dim)
+    assert read_vector_index_rows(db) is None

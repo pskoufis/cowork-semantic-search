@@ -49,6 +49,13 @@ TABLE_NAME = "chunks"
 # codebook; above it is the regime an ANN index exists for.
 VECTOR_INDEX_MIN_ROWS = 20_000
 
+# Growth multiplier that triggers a full IVF retrain. Between rebuilds, new
+# rows are folded into the existing index by optimize_table() — cheap and
+# incremental. A full retrain (which recomputes the partition count, frozen at
+# build time) only happens once the table has grown this many times larger than
+# at the last full build, so routine runs never pay an O(n) rebuild.
+VECTOR_INDEX_RETRAIN_GROWTH = 4
+
 # Spreadsheet descriptions awaiting LLM-generated text. Stored in the same
 # LanceDB as `chunks` but as a separate table — no vectors, pure metadata.
 PENDING_TABLE_NAME = "pending_descriptions"
@@ -88,7 +95,7 @@ class VectorStore:
             # sidecar) fall back to the historical default width.
             from server.index_meta import read_meta
             meta = read_meta(db_path)
-            dim = int(meta["dim"]) if meta else EMBEDDING_DIM
+            dim = int(meta["dim"]) if meta and meta.get("dim") is not None else EMBEDDING_DIM
         self._dim = dim
         self._schema = make_schema(dim)
 
@@ -264,12 +271,31 @@ class VectorStore:
         rows = table.search().select(["source_file"]).limit(n).to_list()
         return list({r["source_file"] for r in rows})
 
+    def _has_index_on(self, column: str) -> bool:
+        """True if any index covers ``column``. Used to build each index once
+        and then leave it to optimize_table() to maintain incrementally."""
+        table = self._get_table()
+        if table is None:
+            return False
+        try:
+            return any(column in (idx.columns or []) for idx in table.list_indices())
+        except Exception:
+            return False
+
     def create_fts_index(self) -> None:
-        """Create or rebuild the full-text search index on the text column."""
+        """Build the native FTS index once, on the text column.
+
+        No-op if an FTS index already exists: new rows are folded into it
+        incrementally by optimize_table(), so routine runs never rebuild it.
+        Native FTS (use_tantivy=False) is what supports that incremental
+        maintenance — a Tantivy index would not.
+        """
         table = self._get_table()
         if table is None:
             return
-        table.create_fts_index("text", replace=True)
+        if self._has_index_on("text"):
+            return
+        table.create_fts_index("text", use_tantivy=False, replace=True)
 
     def optimize_table(self) -> None:
         """Compact small fragments and drop superseded versions.
@@ -282,20 +308,9 @@ class VectorStore:
             return
         table.optimize(cleanup_older_than=timedelta(seconds=0))
 
-    def create_vector_index(self) -> None:
-        """Build (or rebuild) an IVF_PQ ANN index on the vector column.
-
-        No-ops while the table is small (below VECTOR_INDEX_MIN_ROWS rows):
-        a flat scan is already fast there and IVF_PQ cannot train. Above the
-        threshold the index is built with replace=True, so each call supersedes
-        the previous index as the table grows.
-        """
-        table = self._get_table()
-        if table is None:
-            return
-        n = table.count_rows()
-        if n < VECTOR_INDEX_MIN_ROWS:
-            return
+    def _build_vector_index(self, table, n: int) -> None:
+        """Do the full IVF_PQ (re)build and record the row count it trained on."""
+        from server.index_meta import write_vector_index_rows
         table.create_index(
             metric="cosine",
             vector_column_name="vector",
@@ -304,6 +319,37 @@ class VectorStore:
             num_sub_vectors=self._dim // 8,  # IVF_PQ subspace count; 8 floats per sub-vector
             replace=True,
         )
+        write_vector_index_rows(self._db_path, n)
+
+    def create_vector_index(self) -> None:
+        """Build the IVF_PQ ANN index, retraining only after substantial growth.
+
+        Incremental by default: once an index exists, new rows are folded into
+        it by optimize_table(), so routine runs never pay an O(n) rebuild. A
+        full (re)build happens only when:
+
+          * no vector index exists yet and the table has crossed
+            VECTOR_INDEX_MIN_ROWS (the first build), or
+          * the table has grown >= VECTOR_INDEX_RETRAIN_GROWTH x since the last
+            full build — IVF's partition count is frozen at build time, so a
+            retrain recomputes it for the larger corpus and keeps search fast.
+
+        No-ops below VECTOR_INDEX_MIN_ROWS: a flat scan is already fast there
+        and IVF_PQ cannot train a useful codebook on so few rows.
+        """
+        from server.index_meta import read_vector_index_rows
+        table = self._get_table()
+        if table is None:
+            return
+        n = table.count_rows()
+        if n < VECTOR_INDEX_MIN_ROWS:
+            return
+        if not self._has_index_on("vector"):
+            self._build_vector_index(table, n)
+            return
+        last = read_vector_index_rows(self._db_path)
+        if last is None or n >= last * VECTOR_INDEX_RETRAIN_GROWTH:
+            self._build_vector_index(table, n)
 
     def fts_search(
         self,

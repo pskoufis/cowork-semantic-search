@@ -4,6 +4,15 @@ import pyarrow as pa
 import pytest
 
 from server.store import VectorStore, TABLE_NAME, EMBEDDING_DIM
+from server.index_meta import write_meta
+from server.embedding_models import resolve_profile, DEFAULT_ALIAS
+
+
+def _seed_sidecar(store):
+    """Write the model/dim sidecar the way the indexer does at setup, so
+    row-count tracking (which merges into it) behaves as in production."""
+    profile, _ = resolve_profile(DEFAULT_ALIAS, None)
+    write_meta(store._db_path, profile, EMBEDDING_DIM)
 
 # Pre-Tier-2 schema (no mtime_ns / file_size) — used to test in-place migration.
 # Uses the current EMBEDDING_DIM, not a historical one, so the migration test
@@ -186,10 +195,14 @@ def test_hybrid_search(store):
     assert "rrf_score" in results[0]
 
 
-def _random_chunks(n: int) -> list[dict]:
-    """n chunk dicts with unique ids and random unit vectors — no embedding model."""
+def _random_chunks(n: int, start: int = 0) -> list[dict]:
+    """n chunk dicts with unique ids and random unit vectors — no embedding model.
+
+    ``start`` offsets the id/seed range so successive batches don't collide,
+    letting a test grow a table past an existing index.
+    """
     chunks = []
-    for i in range(n):
+    for i in range(start, start + n):
         rng = np.random.RandomState(i)
         vec = rng.randn(EMBEDDING_DIM).astype(np.float32)
         vec = vec / np.linalg.norm(vec)
@@ -233,12 +246,91 @@ def test_create_vector_index_builds_above_threshold(store, monkeypatch):
 
 
 def test_create_vector_index_refresh_is_idempotent(store, monkeypatch):
-    """Re-running create_vector_index replaces the index rather than erroring."""
+    """Re-running create_vector_index leaves a single index, never erroring."""
     monkeypatch.setattr("server.store.VECTOR_INDEX_MIN_ROWS", 256)
     store.add_chunks(_random_chunks(600))
     store.create_vector_index()
     store.create_vector_index()
     assert len(store._get_table().list_indices()) == 1
+
+
+def test_create_vector_index_skips_rebuild_when_growth_is_small(store, monkeypatch):
+    """Incremental: once a vector index exists, a routine run that adds only a
+    few rows must NOT trigger a full IVF retrain. New rows are folded in by
+    optimize_table() instead, so we never pay an O(n) rebuild on every run."""
+    monkeypatch.setattr("server.store.VECTOR_INDEX_MIN_ROWS", 256)
+    _seed_sidecar(store)
+    store.add_chunks(_random_chunks(300))
+    store.create_vector_index()  # first build, records 300
+
+    table = store._get_table()
+    calls = []
+    monkeypatch.setattr(table, "create_index",
+                        lambda *a, **k: calls.append((a, k)))
+
+    store.add_chunks(_random_chunks(100, start=300))  # 400 rows total, <4x
+    store.create_vector_index()
+    assert calls == []  # no retrain
+
+
+def test_create_vector_index_retrains_after_large_growth(store, monkeypatch):
+    """When the table has grown >= VECTOR_INDEX_RETRAIN_GROWTH x since the last
+    full build, the IVF index is retrained so its partition count tracks the
+    larger corpus instead of staying frozen at the first-build value."""
+    monkeypatch.setattr("server.store.VECTOR_INDEX_MIN_ROWS", 256)
+    _seed_sidecar(store)
+    store.add_chunks(_random_chunks(300))
+    store.create_vector_index()  # first build, records 300
+
+    table = store._get_table()
+    calls = []
+    real_create_index = table.create_index
+
+    def spy(*a, **k):
+        calls.append((a, k))
+        return real_create_index(*a, **k)
+
+    monkeypatch.setattr(table, "create_index", spy)
+
+    store.add_chunks(_random_chunks(1000, start=300))  # 1300 rows, >= 4x of 300
+    store.create_vector_index()
+    assert len(calls) == 1  # retrained
+
+
+def test_create_fts_index_skips_rebuild_when_index_exists(store):
+    """Incremental: the FTS index is built once. A second call must not rebuild
+    it — new rows are folded into the native FTS index by optimize_table()."""
+    store.add_chunks(_random_chunks(20))
+    store.create_fts_index()  # first build
+
+    table = store._get_table()
+    calls = []
+    orig = table.create_fts_index
+    table.create_fts_index = lambda *a, **k: calls.append((a, k))
+    try:
+        store.create_fts_index()
+    finally:
+        table.create_fts_index = orig
+    assert calls == []  # no rebuild
+
+
+def test_fts_finds_docs_added_after_index_built(store):
+    """A document added AFTER the (build-once) FTS index must still be findable
+    via FTS once optimize_table() has folded it in. Guards against build-once
+    silently dropping new docs from full-text/hybrid search — FTS has no large
+    flat-scan fallback to lean on, unlike vector search."""
+    base = _make_chunks([f"ordinary document {i}" for i in range(20)],
+                         source_file="/fake/base.txt")
+    store.add_chunks(base)
+    store.create_fts_index()  # built before the sentinel doc exists
+
+    new = _make_chunks(["this contains the rare token zzqqx"],
+                       source_file="/fake/new.txt")
+    store.add_chunks(new)
+    store.optimize_table()  # the only step that folds it into the FTS index
+
+    hits = store.fts_search("zzqqx")
+    assert any(h["source_file"] == "/fake/new.txt" for h in hits)
 
 
 # --- Tier 2: schema, bulk reads, stat refresh, compaction ---
