@@ -392,6 +392,69 @@ def get_index_status(
     return out
 
 
+@mcp.tool(annotations={"readOnlyHint": True})
+def trace_source(
+    file_path: Annotated[
+        str,
+        Field(
+            description="Absolute path to an unpacked file under target_root — "
+                        "either a per-message .txt body or an extracted "
+                        "attachment."
+        ),
+    ],
+    source_root: Annotated[
+        str,
+        Field(
+            description="Root folder the archives were unpacked FROM (the tree "
+                        "of original .pst/.mbox/.msg files)."
+        ),
+    ],
+    target_root: Annotated[
+        str,
+        Field(
+            description="Root folder the archives were unpacked INTO (contains "
+                        "the unpacked trees and, when present, a _runlogs/ "
+                        "ledger)."
+        ),
+    ],
+) -> dict:
+    """Trace an unpacked file back to the .pst/.mbox/.msg it came from.
+
+    Given a file under `target_root` (a per-message `.txt` or an extracted
+    attachment), returns the originating archive plus provenance detail: the
+    archive type, whether it still exists on disk, the internal PST folder and
+    message number when known, and — for an attachment — the owning message
+    `.txt`.
+
+    Resolution tries the unpack run-log under `<target_root>/_runlogs` first
+    (authoritative, and the only reliable route for flattened mbox outputs),
+    then falls back to the path convention. On a file that can't be resolved —
+    not under `target_root`, missing, or an ambiguous mbox with no run-log —
+    returns `{"error": ...}` instead of raising.
+    """
+    from server.provenance import trace_source as _trace_source
+
+    try:
+        trace = _trace_source(file_path, source_root, target_root)
+    except (FileNotFoundError, ValueError, LookupError) as exc:
+        return {"error": str(exc)}
+
+    return {
+        "source_archive": str(trace.source_archive),
+        "archive_type": trace.archive_type,
+        "archive_exists": trace.archive_exists,
+        "method": trace.method,
+        "internal_folder": trace.internal_folder,
+        "message_number": trace.message_number,
+        "attachment_of": (
+            str(trace.attachment_of) if trace.attachment_of is not None else None
+        ),
+        "runlog_path": (
+            str(trace.runlog_path) if trace.runlog_path is not None else None
+        ),
+    }
+
+
 @mcp.tool(
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True}
 )

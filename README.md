@@ -196,6 +196,7 @@ Works the same with PDFs, Word docs, PowerPoints, and CSVs -- just point it at a
 | `semantic_search` | Search indexed documents using natural language. Supports `vector` and `hybrid` modes. |
 | `get_index_status` | Show total chunks, file count, indexed files, index size on disk, and background-job history. Pass `folder_path` to also surface the active `.semanticignore` for that folder. |
 | `reindex_file` | Force re-index a single file, bypassing the hash cache. Bypasses exclusion rules -- this is an explicit per-file act. |
+| `trace_source` | Given an unpacked `.txt` or extracted attachment, return the source `.pst`/`.mbox`/`.msg` it came from, plus the internal PST folder, message number, and (for attachments) the owning message `.txt`. Pass the `source_root` and `target_root` used during unpacking. Resolves via the `_runlogs/` ledger when present (required for flattened mbox outputs), else by the path convention. |
 
 ## Command line — `csemsearch`
 
