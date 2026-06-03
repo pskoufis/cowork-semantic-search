@@ -275,6 +275,31 @@ restart the client so the new index is built with the chosen model.
 </details>
 
 <details>
+<summary><strong>Searching multiple indexes at once</strong></summary>
+
+Set `LANCEDB_PATHS` to several index directories (joined like `PATH`, with `:`
+on macOS/Linux) and every search fans out across all of them, fusing the
+per-index results into one ranked list via Reciprocal Rank Fusion. Because RRF
+is rank-based, indexes built with **different embedding models** merge fairly.
+`get_index_status` reports a per-index breakdown plus totals.
+
+```json
+{ "env": { "LANCEDB_PATHS": "/data/idx-qwen:/data/idx-bge" } }
+```
+
+Indexing still targets one index: pass `--db-path` (or `LANCEDB_PATH`); with
+only `LANCEDB_PATHS` set, indexing writes to the **first** path. A missing or
+busy index is skipped (search still returns the others' hits).
+
+**Known limitation:** fusion is purely rank-based, so an index whose corpus is
+irrelevant to the query still contributes its top-ranked (but off-topic) hits
+at the same base weight. Best when the indexes hold genuinely different
+corpora you want unioned; if one index is simply irrelevant to a query, search
+that index alone with `--db-path`.
+
+</details>
+
+<details>
 <summary><strong>Portable index (external drive)</strong></summary>
 
 By default the index lives in `./lancedb` next to the server. To make the index **portable** -- so it survives an external drive being re-plugged at a different mount point, or moved between Macs -- set the `LANCEDB_PATH` environment variable to a directory **on the same drive as your documents**:
