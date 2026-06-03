@@ -352,7 +352,10 @@ def _rrf_merge(per_index: list[tuple[str, list[dict]]], top_k: int, rrf_k: int =
     out = []
     for key, score in ranked:
         row = {k: v for k, v in rep[key].items() if k != "_rank"}
-        row["score"] = score
+        # Keep the native per-index `score` (cosine distance / fts score) intact
+        # so single-index output is byte-for-byte as before; expose the fused
+        # rank score separately. RRF is monotonic in rank, so sorting by
+        # rrf_score reproduces the single-index order exactly.
         row["rrf_score"] = score
         row["from_indexes"] = froms[key]
         out.append(row)
@@ -772,7 +775,7 @@ def search_cmd(query, *, db_path: str | None, mode="vector", top_k=10, folder=No
     print(f"Searching ({mode}, n={top_k}) across {len(result.get('indexes_searched', []))} index(es)…")
     print()
     for i, row in enumerate(results, start=1):
-        score = row.get("score") or 0.0
+        score = row.get("rrf_score") or row.get("score") or 0.0
         path = row.get("source_file", "(unknown)")
         origin = os.path.basename(row.get("index_path", "")) or "?"
         snippet = (row.get("text") or "").replace("\n", " ").strip()
@@ -831,6 +834,12 @@ is rank-based, indexes built with **different embedding models** merge fairly.
 Indexing still targets one index: pass `--db-path` (or `LANCEDB_PATH`); with
 only `LANCEDB_PATHS` set, indexing writes to the **first** path. A missing or
 busy index is skipped (search still returns the others' hits).
+
+**Known limitation:** fusion is purely rank-based, so an index whose corpus is
+irrelevant to the query still contributes its top-ranked (but off-topic) hits
+at the same base weight. Best when the indexes hold genuinely different
+corpora you want unioned; if one index is simply irrelevant to a query, search
+that index alone with `--db-path`.
 
 </details>
 ```
