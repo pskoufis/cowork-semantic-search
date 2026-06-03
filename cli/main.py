@@ -198,9 +198,11 @@ def _dispatch_status(args: argparse.Namespace, db_path: str) -> int:
     return status_cmd(db_path)
 
 
-def _dispatch_unpack(args: argparse.Namespace, db_path: str) -> int:
+def _dispatch_unpack(args: argparse.Namespace, db_path: str | None) -> int:
     from cli.commands import unpack_cmd
+    from server.db_paths import resolve_write_dir
 
+    db_path = resolve_write_dir(db_path)
     return unpack_cmd(
         args.folder,
         recursive=not args.no_recursive,
@@ -209,9 +211,11 @@ def _dispatch_unpack(args: argparse.Namespace, db_path: str) -> int:
     )
 
 
-def _dispatch_index(args: argparse.Namespace, db_path: str) -> int:
+def _dispatch_index(args: argparse.Namespace, db_path: str | None) -> int:
     from cli.commands import index_cmd
+    from server.db_paths import resolve_write_dir
 
+    db_path = resolve_write_dir(db_path)
     return index_cmd(
         args.folder,
         db_path=db_path,
@@ -223,9 +227,11 @@ def _dispatch_index(args: argparse.Namespace, db_path: str) -> int:
     )
 
 
-def _dispatch_run(args: argparse.Namespace, db_path: str) -> int:
+def _dispatch_run(args: argparse.Namespace, db_path: str | None) -> int:
     from cli.commands import run_cmd
+    from server.db_paths import resolve_write_dir
 
+    db_path = resolve_write_dir(db_path)
     return run_cmd(
         args.folder,
         db_path=db_path,
@@ -248,10 +254,11 @@ def _dispatch_search(args: argparse.Namespace, db_path: str) -> int:
     )
 
 
-def _dispatch_reindex(args: argparse.Namespace, db_path: str) -> int:
+def _dispatch_reindex(args: argparse.Namespace, db_path: str | None) -> int:
     from cli.commands import reindex_cmd
+    from server.db_paths import resolve_write_dir
 
-    return reindex_cmd(args.file_path, db_path=db_path)
+    return reindex_cmd(args.file_path, db_path=resolve_write_dir(db_path))
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +283,10 @@ def main(argv: list[str] | None = None) -> int:
 
     configure_logging(verbose=args.verbose, quiet=args.quiet)
 
-    db_path = _resolve_db_path(args.db_path)
+    # Pass the explicit --db-path through verbatim (None when unset). Read
+    # commands (search/status) fan out across LANCEDB_PATHS; write commands
+    # collapse to a single target. Each dispatcher resolves accordingly.
+    db_path = args.db_path
 
     handler = getattr(args, "handler", None)
     if handler is None:

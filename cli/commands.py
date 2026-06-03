@@ -51,8 +51,22 @@ def _format_timestamp(ts: float | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def status_cmd(db_path: str) -> int:
-    """Print index size, counts, and recent job history.
+def status_cmd(db_path: str | None) -> int:
+    """Print status for every configured index (fan-out over LANCEDB_PATHS),
+    or a single index when --db-path / LANCEDB_PATH names one."""
+    from server.db_paths import resolve_db_dirs
+
+    db_dirs = resolve_db_dirs(db_path)
+    rc = 0
+    for i, d in enumerate(db_dirs):
+        if i:
+            print()
+        rc = _print_one_status(d) or rc
+    return rc
+
+
+def _print_one_status(db_path: str) -> int:
+    """Print one index's size, counts, model, and recent job history.
 
     On an empty / non-existent ``db_path`` (no prior indexing) prints a
     pointer to ``csemsearch index`` and exits 0 — not an error, just a
@@ -439,21 +453,30 @@ def run_cmd(
 def search_cmd(
     query: str,
     *,
-    db_path: str,
+    db_path: str | None,
     mode: str = "vector",
     top_k: int = 10,
     folder: str | None = None,
 ) -> int:
     r"""Run ``semantic_search`` and print a ranked list with file paths,
-    scores, and text snippets. Output goes to stdout so callers can pipe
-    it (e.g. ``csemsearch search foo | grep '\.pdf'``)."""
+    scores, and text snippets. Fans out across all configured indexes
+    (LANCEDB_PATHS) when ``db_path`` is None. Output goes to stdout so callers
+    can pipe it (e.g. ``csemsearch search foo | grep '\.pdf'``)."""
     from server.search import semantic_search
 
-    if not os.path.isdir(db_path):
-        logger.error("index not found at %s. Run `csemsearch index` first.", db_path)
-        return 1
     if mode not in ("vector", "hybrid"):
         logger.error("--mode must be 'vector' or 'hybrid', got %r", mode)
+        return 1
+
+    # Error only when *no* configured index exists (e.g. a typo'd --db-path);
+    # during fan-out, a missing index among several is skipped, not fatal.
+    from server.db_paths import resolve_db_dirs
+    dirs = resolve_db_dirs(db_path)
+    if not any(os.path.isdir(d) for d in dirs):
+        if len(dirs) == 1:
+            logger.error("index not found at %s. Run `csemsearch index` first.", dirs[0])
+        else:
+            logger.error("no index found in any of: %s", ", ".join(dirs))
         return 1
 
     folder_abs = os.path.abspath(folder) if folder else None
@@ -465,20 +488,30 @@ def search_cmd(
         mode=mode,
     )
 
+    for sk in result.get("skipped", []):
+        logger.warning("skipped index %s (%s)", sk["index"], sk["reason"])
+
     results = result.get("results", [])
     if not results:
         print(f"No results for: {query!r} (mode={mode}, top_k={top_k})")
         return 0
 
-    print(f"Searching ({mode}, n={top_k})…")
+    n_indexes = len(result.get("indexes_searched", []))
+    multi = n_indexes > 1
+    print(f"Searching ({mode}, n={top_k}) across {n_indexes} index(es)…")
     print()
     for i, row in enumerate(results, start=1):
-        score = row.get("_distance") or row.get("score") or row.get("_relevance_score") or 0.0
+        score = row.get("rrf_score") or row.get("score") or 0.0
         path = row.get("source_file", "(unknown)")
         snippet = (row.get("text") or "").replace("\n", " ").strip()
         if len(snippet) > 200:
             snippet = snippet[:197] + "…"
-        print(f"{i:>2}  {float(score):.2f}  {path}")
+        # Show which index a hit came from only when fanning out, to keep
+        # single-index output uncluttered.
+        origin = ""
+        if multi:
+            origin = f"[{os.path.basename(row.get('index_path', '')) or '?'}]  "
+        print(f"{i:>2}  {float(score):.3f}  {origin}{path}")
         if snippet:
             print(f"      …{snippet}…")
     return 0
