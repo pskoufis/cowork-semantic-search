@@ -271,7 +271,8 @@ def reindex_one_file(file_path: str, db_path: str | None = None) -> dict:
         raise FileNotFoundError(f"File not found: {file_path}")
 
     if db_path is None:
-        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+        from server.db_paths import resolve_write_dir
+        db_path = resolve_write_dir(None)
     db_dir = os.path.abspath(db_path)
 
     try:
@@ -400,7 +401,8 @@ def index_folder(
         raise FileNotFoundError(f"Folder not found: {folder_path}")
 
     if db_path is None:
-        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+        from server.db_paths import resolve_write_dir
+        db_path = resolve_write_dir(None)
     db_dir = os.path.abspath(db_path)
 
     # Compile exclusion rules early — a bad pattern raises ValueError before

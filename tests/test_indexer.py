@@ -1173,3 +1173,22 @@ def test_index_folder_rejects_conflicting_model(mock_get_model, tmp_path, monkey
     with pytest.raises(ValueError) as exc:
         index_folder(str(corpus), db_path=db, unpack_first=False)
     assert "minilm" in str(exc.value) and "bge-small" in str(exc.value)
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_writes_to_first_of_paths(mock_get_model, tmp_path, monkeypatch):
+    mock_get_model.return_value = type(
+        "MockModel", (), {"encode": lambda self, t, **k: _fake_embed(t)}
+    )()
+    corpus = tmp_path / "c"
+    corpus.mkdir()
+    (corpus / "a.txt").write_text("hello")
+    a, b = str(tmp_path / "A"), str(tmp_path / "B")
+    monkeypatch.delenv("LANCEDB_PATH", raising=False)
+    monkeypatch.setenv("LANCEDB_PATHS", f"{a}{os.pathsep}{b}")
+
+    index_folder(str(corpus), unpack_first=False)  # no db_path → first of paths
+
+    from server.index_meta import read_meta
+    assert read_meta(a) is not None       # wrote into the first index
+    assert read_meta(b) is None           # not the second

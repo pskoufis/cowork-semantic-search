@@ -173,7 +173,8 @@ async def index_folder(
         raise FileNotFoundError(f"Folder not found: {folder_path}")
 
     if db_path is None:
-        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+        from server.db_paths import resolve_write_dir
+        db_path = resolve_write_dir(None)
     db_dir = os.path.abspath(db_path)
 
     # Compile exclusions up front so a bad pattern is reported synchronously
@@ -480,7 +481,8 @@ def list_pending_descriptions(
     from server.paths import to_absolute
 
     if db_path is None:
-        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+        from server.db_paths import resolve_write_dir
+        db_path = resolve_write_dir(None)
     db_dir = os.path.abspath(db_path)
 
     store = VectorStore(db_dir)
@@ -795,7 +797,8 @@ def submit_description(
       | "description_too_large" | "not_pending" | "item_not_needed"}
     """
     if db_path is None:
-        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+        from server.db_paths import resolve_write_dir
+        db_path = resolve_write_dir(None)
     db_dir = os.path.abspath(db_path)
     return _submit_one_description(
         db_dir=db_dir,
@@ -840,7 +843,8 @@ def dismiss_pending_description(
         return {"status": "rejected", "reason": "file_not_found"}
 
     if db_path is None:
-        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
+        from server.db_paths import resolve_write_dir
+        db_path = resolve_write_dir(None)
     db_dir = os.path.abspath(db_path)
     source_rel = to_relative(str(path), db_dir)
 
