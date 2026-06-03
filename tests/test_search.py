@@ -174,3 +174,53 @@ def test_hybrid_search_does_not_rebuild_fts_index(mock_get_model, tmp_path):
     with patch.object(VectorStore, "create_fts_index") as fts_spy:
         semantic_search("revenue", db_path=db_path, mode="hybrid")
     fts_spy.assert_not_called()
+
+
+# --- index records its model; search loads it (env ignored) ---------------
+
+from server.index_meta import write_meta as _write_meta
+from server.embedding_models import resolve_profile as _resolve_profile
+
+
+def _fake_embed_384(texts):
+    out = []
+    for t in texts:
+        rng = np.random.RandomState(hash(t) % 2**32)
+        v = rng.randn(384).astype(np.float32)
+        v = v / np.linalg.norm(v)
+        out.append(v)
+    return np.array(out)
+
+
+def test_search_loads_model_from_meta_ignoring_env(tmp_path, monkeypatch):
+    db = str(tmp_path / "idx")
+    profile, dim = _resolve_profile("minilm", None)  # 384-dim index
+    _write_meta(db, profile, dim)
+
+    store = VectorStore(db, dim=384)
+    # Seed 384-dim rows so they match the recorded index width.
+    chunks = []
+    for i, text in enumerate(["alpha doc", "beta doc"]):
+        vec = _fake_embed_384([text])[0]
+        chunks.append({
+            "id": f"c_{i}", "text": text, "source_file": "corpus/d.txt",
+            "file_name": "d.txt", "file_type": ".txt", "folder_path": "corpus",
+            "chunk_index": i, "content_hash": "h", "mtime_ns": 0, "file_size": 0,
+            "vector": vec.tolist(),
+        })
+    store.add_chunks(chunks)
+
+    captured = {}
+
+    def fake_get_model(p, d):
+        captured["alias"] = p.alias
+        captured["dim"] = d
+        return type("M", (), {"encode": lambda self, texts, **kw: _fake_embed_384(texts)})()
+
+    monkeypatch.setenv("EMBEDDING_MODEL", "qwen3-0.6b")  # must be ignored
+    with patch("server.search.get_model", fake_get_model):
+        out = semantic_search("alpha", db_path=db)
+
+    assert captured["alias"] == "minilm"
+    assert captured["dim"] == 384
+    assert out["total_results"] >= 1

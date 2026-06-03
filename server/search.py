@@ -3,7 +3,8 @@
 import os
 
 from server.store import VectorStore
-from server.indexer import get_model
+from server.indexer import get_model, encode_query
+from server.index_meta import resolve_index_profile
 from server.paths import to_relative, to_absolute
 
 
@@ -19,15 +20,18 @@ def semantic_search(
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
     db_dir = os.path.abspath(db_path)
 
-    store = VectorStore(db_dir)
+    # The index records the model/dim that built it; search loads that model
+    # regardless of any EMBEDDING_MODEL env override (read path).
+    profile, dim = resolve_index_profile(
+        db_dir, env_alias=None, env_dim=None, for_write=False
+    )
+    store = VectorStore(db_dir, dim=dim)
 
-    model = get_model()
-    # Qwen3-Embedding ships a built-in "query" prompt for retrieval — wraps the
-    # query in an "Instruct: ... Query: ..." template and yields a 1–5% lift
-    # vs encoding plain. Documents are still encoded without a prompt.
-    query_embedding = model.encode(
-        [query], normalize_embeddings=True, prompt_name="query",
-    )[0].tolist()
+    model = get_model(profile, dim)
+    # encode_query applies the profile's query handling: Qwen's built-in
+    # "query" prompt, a bge/e5-style instruction prefix, or plain — and always
+    # encodes documents (at index time) without it.
+    query_embedding = encode_query(model, profile, query)[0].tolist()
 
     # The caller passes an absolute folder path; the store holds paths in the
     # form chosen by to_relative (relative for same-volume, absolute for
