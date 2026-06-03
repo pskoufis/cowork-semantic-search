@@ -28,6 +28,8 @@ from typing import Callable, Iterator, Tuple
 _PR_MESSAGE_CLASS = 0x001A          # PidTagMessageClass
 _PR_ATTACH_LONG_FILENAME = 0x3707   # PidTagAttachLongFilename
 _PR_ATTACH_FILENAME = 0x3704        # PidTagAttachFilename (8.3 short name)
+_PR_DISPLAY_TO = 0x0E04             # PidTagDisplayTo (semicolon-joined names)
+_PR_DISPLAY_CC = 0x0E03             # PidTagDisplayCc
 
 # Attachment streaming chunk size — matches the prior inline extractor's
 # 1 MB step. pypff returns at most this many bytes per ``read_buffer``
@@ -50,6 +52,8 @@ class ParsedPstMessage:
     date: str
     body: str
     attachments: Tuple[ParsedPstAttachment, ...]
+    to: str = ""                # PidTagDisplayTo — semicolon-joined To: names
+    cc: str = ""                # PidTagDisplayCc — semicolon-joined Cc: names
     error: str | None = None    # populated when this single message failed to parse
 
 
@@ -120,6 +124,8 @@ def _walk_pst_folder(folder, folder_path: str) -> Iterator[ParsedPstMessage]:
 def _build_parsed_message(message, folder_path: str) -> ParsedPstMessage:
     subject = _pst_decode(_pst_safe(message.get_subject)) or ""
     sender = _pst_decode(_pst_safe(message.get_sender_name)) or ""
+    to = _pst_decode(_pst_prop_string(message, _PR_DISPLAY_TO))
+    cc = _pst_decode(_pst_prop_string(message, _PR_DISPLAY_CC))
     sent = (_pst_safe(message.get_client_submit_time)
             or _pst_safe(message.get_delivery_time))
     date = "" if sent is None else str(sent)
@@ -143,6 +149,8 @@ def _build_parsed_message(message, folder_path: str) -> ParsedPstMessage:
         date=date,
         body=body,
         attachments=tuple(attachments),
+        to=to,
+        cc=cc,
     )
 
 

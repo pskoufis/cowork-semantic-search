@@ -33,6 +33,8 @@ def _msg(
     date: str = "2024-03-01 12:00:00+00:00",
     body: str = "body text",
     attachments: tuple = (),
+    to: str = "",
+    cc: str = "",
     error: str | None = None,
 ):
     from pst_handling.messages import ParsedPstMessage
@@ -43,6 +45,8 @@ def _msg(
         date=date,
         body=body,
         attachments=attachments,
+        to=to,
+        cc=cc,
         error=error,
     )
 
@@ -159,6 +163,7 @@ def test_unpack_header_block_includes_folder_and_canonical_lines(
     _install_iter(monkeypatch, [
         _msg(folder_path="Top/Inbox", subject="Quarterly numbers",
              sender="Alice", date="2024-03-01 10:00:00+00:00",
+             to="Bob; Carol", cc="Dave",
              body="Revenue is up."),
     ])
 
@@ -166,8 +171,8 @@ def test_unpack_header_block_includes_folder_and_canonical_lines(
     txt = next((out / "Top" / "Inbox").glob("msg-0001_*.txt"))
     content = txt.read_text(encoding="utf-8")
     assert "From: Alice" in content
-    assert "To: " in content
-    assert "Cc: " in content
+    assert "To: Bob; Carol" in content
+    assert "Cc: Dave" in content
     assert "Subject: Quarterly numbers" in content
     assert "Date: 2024-03-01 10:00:00+00:00" in content
     assert "Message-ID: " in content
@@ -576,6 +581,70 @@ def test_iter_pst_messages_filters_non_mail_items_via_real_walk(monkeypatch):
     # starts paths at the root's children, matching the prior
     # _walk_pst_folder convention.
     assert out[0].folder_path == "Inbox"
+
+
+def test_build_parsed_message_reads_display_to_and_cc_from_record_sets():
+    """To/Cc come from PidTagDisplayTo (0x0E04) / PidTagDisplayCc (0x0E03)
+    scanned out of the message's record sets — same mechanism as message
+    class. Confirms the plumbing reads those entry types."""
+    from pst_handling.messages import (
+        _build_parsed_message,
+        _PR_DISPLAY_TO,
+        _PR_DISPLAY_CC,
+    )
+
+    class FakeEntry:
+        def __init__(self, entry_type, value):
+            self.entry_type = entry_type
+            self._value = value
+        def get_data_as_string(self):
+            return self._value
+
+    class FakeRecordSet:
+        def __init__(self, entries):
+            self.entries = entries
+
+    class FakeMessage:
+        record_sets = [FakeRecordSet([
+            FakeEntry(_PR_DISPLAY_TO, "Bob Jones; Carol Smith"),
+            FakeEntry(_PR_DISPLAY_CC, "Dave Lee"),
+        ])]
+        def get_subject(self): return "Subj"
+        def get_sender_name(self): return "Alice"
+        def get_client_submit_time(self): return "2024-03-01"
+        def get_delivery_time(self): return None
+        def get_plain_text_body(self): return "hi"
+        def get_html_body(self): return None
+        def get_rtf_body(self): return None
+        def get_number_of_attachments(self): return 0
+        def get_attachment(self, i): raise IndexError
+
+    parsed = _build_parsed_message(FakeMessage(), "Top/Inbox")
+    assert parsed.to == "Bob Jones; Carol Smith"
+    assert parsed.cc == "Dave Lee"
+
+
+def test_build_parsed_message_to_cc_empty_when_props_absent():
+    """When the display props aren't present (some PSTs only store
+    recipients in the recipients sub-table), To/Cc fall back to empty —
+    no crash, consistent header shape."""
+    from pst_handling.messages import _build_parsed_message
+
+    class FakeMessage:
+        record_sets = []
+        def get_subject(self): return "Subj"
+        def get_sender_name(self): return "Alice"
+        def get_client_submit_time(self): return "2024-03-01"
+        def get_delivery_time(self): return None
+        def get_plain_text_body(self): return "hi"
+        def get_html_body(self): return None
+        def get_rtf_body(self): return None
+        def get_number_of_attachments(self): return 0
+        def get_attachment(self, i): raise IndexError
+
+    parsed = _build_parsed_message(FakeMessage(), "Top/Inbox")
+    assert parsed.to == ""
+    assert parsed.cc == ""
 
 
 # --- Negative cases on parsers.py dispatch ----------------------------------

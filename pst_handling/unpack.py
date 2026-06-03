@@ -289,14 +289,16 @@ def _format_message_text(
     """Match the mbox/msg unpack header-block layout so unpacked PST
     messages produce identical embedding context.
 
-    PST exposes Subject / From / Date directly via pypff but not To /
-    Cc / Message-ID — those header lines are emitted but left empty,
-    so the header shape stays consistent across all three formats.
+    PST exposes Subject / From / Date directly via pypff, and To / Cc
+    via the PidTagDisplayTo / PidTagDisplayCc MAPI properties (the
+    semicolon-joined display names Outlook shows). Message-ID is not
+    exposed, so that line stays empty — keeping the header shape
+    consistent across all three formats.
     """
     lines = [
         f"From: {message.sender or ''}",
-        "To: ",
-        "Cc: ",
+        f"To: {message.to or ''}",
+        f"Cc: {message.cc or ''}",
         f"Subject: {message.subject or ''}",
         f"Date: {message.date or ''}",
         "Message-ID: ",
