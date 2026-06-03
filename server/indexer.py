@@ -86,12 +86,10 @@ def exceeds_size_cap(file_path: Path, size: int) -> bool:
     return size > MAX_FILE_SIZE_BYTES
 
 
-# Qwen3-Embedding-0.6B: 1024-dim native, MRL-supported. We truncate to
-# EMBEDDING_DIM (from store.py — currently 256) via Matryoshka — the head
-# dimensions are first-class, not a naive slice.
-EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-
-_model = None
+# SentenceTransformer instances cached by (model_id, dim). A process usually
+# touches one model, but search and a description-drain can both run with the
+# index's recorded model, so the cache keeps loads to one per distinct model.
+_model_cache: dict[tuple[str, int], object] = {}
 
 
 def _select_device() -> str:
@@ -109,29 +107,58 @@ def _select_device() -> str:
     return "cpu"
 
 
-def get_model():
-    global _model
-    if _model is None:
+def _model_load_kwargs(profile, dim: int) -> dict:
+    """sentence-transformers load kwargs derived from a profile.
+
+    MRL models truncate (and renormalise) to ``dim``; fixed-dim models load at
+    native width. Decoder models (Qwen) need left-padding so last-token pooling
+    never pools a PAD token for shorter sequences in a batch.
+    """
+    kwargs: dict = {"device": _select_device()}
+    if profile.mrl:
+        kwargs["truncate_dim"] = dim
+    if profile.padding_side is not None:
+        kwargs["tokenizer_kwargs"] = {"padding_side": profile.padding_side}
+    return kwargs
+
+
+def get_model(profile, dim: int):
+    """Load (and cache) the SentenceTransformer for a profile/dim."""
+    key = (profile.model_id, dim)
+    model = _model_cache.get(key)
+    if model is None:
         from sentence_transformers import SentenceTransformer
-        from server.store import EMBEDDING_DIM
-        _model = SentenceTransformer(
-            EMBEDDING_MODEL,
-            device=_select_device(),
-            # Matryoshka — sentence-transformers truncates *and* L2-renormalises.
-            truncate_dim=EMBEDDING_DIM,
-            # Qwen3 uses last-token pooling on a decoder; right-padding would
-            # make the pooled token a PAD for shorter sequences in a batch and
-            # silently corrupt embeddings.
-            tokenizer_kwargs={"padding_side": "left"},
+        model = SentenceTransformer(profile.model_id, **_model_load_kwargs(profile, dim))
+        # Fail loudly at load if a profile that relies on a built-in query
+        # prompt loads a model that doesn't expose it — better than dying on
+        # the first user query.
+        if profile.query_prompt_name is not None:
+            if profile.query_prompt_name not in getattr(model, "prompts", {}):
+                raise RuntimeError(
+                    f"{profile.model_id} did not expose a "
+                    f"{profile.query_prompt_name!r} prompt expected by its profile."
+                )
+        _model_cache[key] = model
+    return model
+
+
+def encode_documents(model, profile, texts: list[str]):
+    """Encode passages — no query prompt/prefix, normalised per profile."""
+    return model.encode(
+        texts, show_progress_bar=False, normalize_embeddings=profile.normalize,
+    )
+
+
+def encode_query(model, profile, query: str):
+    """Encode a single query, applying the profile's query prompt/prefix."""
+    if profile.query_prompt_name is not None:
+        return model.encode(
+            [query],
+            normalize_embeddings=profile.normalize,
+            prompt_name=profile.query_prompt_name,
         )
-        # Fail loudly at load if the model upload ever drops the "query" prompt
-        # we rely on in search.py — better than dying on first user query.
-        if "query" not in getattr(_model, "prompts", {}):
-            raise RuntimeError(
-                f"{EMBEDDING_MODEL} did not expose a 'query' prompt; "
-                "server/search.py relies on it. Check the model card / upload."
-            )
-    return _model
+    text = profile.query_prefix + query if profile.query_prefix is not None else query
+    return model.encode([text], normalize_embeddings=profile.normalize)
 
 
 def discover_files(
@@ -187,13 +214,12 @@ def compute_file_hash(file_path: Path) -> str:
     return h.hexdigest()
 
 
-def embed_chunks(chunks: list[dict]) -> list[dict]:
-    model = get_model()
+def embed_chunks(chunks: list[dict], model, profile) -> list[dict]:
     texts = [c["text"] for c in chunks]
     all_embeddings = []
     for i in range(0, len(texts), BATCH_SIZE):
         batch = texts[i:i + BATCH_SIZE]
-        embeddings = model.encode(batch, show_progress_bar=False, normalize_embeddings=True)
+        embeddings = encode_documents(model, profile, batch)
         all_embeddings.extend(embeddings)
     for chunk, embedding in zip(chunks, all_embeddings):
         chunk["vector"] = embedding.tolist()
