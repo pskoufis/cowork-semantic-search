@@ -978,3 +978,53 @@ async def test_status_aggregates_across_indexes(tmp_path, monkeypatch):
         assert aliases == {"minilm", "qwen3-0.6b"}
         assert payload["total_chunks"] == 0  # nothing indexed, but both listed
         assert len(payload["indexes"]) == 2
+
+
+@pytest.mark.anyio
+async def test_mcp_trace_source_identifies_msg(tmp_path):
+    """trace_source maps an unpacked file back to its source .msg, listed and
+    located via the path convention."""
+    import json as _json
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    msg = src / "sub" / "note.msg"
+    msg.parent.mkdir(parents=True)
+    msg.write_bytes(b"")
+    out_dir = dst / "sub"
+    out_dir.mkdir(parents=True)
+    txt = out_dir / "note.txt"
+    txt.write_text("From: a\n\nbody\n", encoding="utf-8")
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "trace_source",
+            {"file_path": str(txt), "source_root": str(src), "target_root": str(dst)},
+        )
+        assert not result.is_error
+        payload = _json.loads(result.content[0].text)
+        assert payload["source_archive"] == str(msg.resolve())
+        assert payload["archive_type"] == "msg"
+        assert payload["method"] == "path"
+        assert payload.get("error") is None
+
+
+@pytest.mark.anyio
+async def test_mcp_trace_source_reports_error_dict(tmp_path):
+    """A file outside target_root yields a structured error, not an exception."""
+    import json as _json
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    dst.mkdir(parents=True)
+    stray = tmp_path / "stray.txt"
+    stray.write_text("x", encoding="utf-8")
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "trace_source",
+            {"file_path": str(stray), "source_root": str(src), "target_root": str(dst)},
+        )
+        assert not result.is_error
+        payload = _json.loads(result.content[0].text)
+        assert "error" in payload
