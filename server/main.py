@@ -309,38 +309,52 @@ def get_index_status(
     from server.exclusions import ExclusionRules, SEMANTICIGNORE_FILENAME
     from pathlib import Path as _Path
 
-    if db_path is None:
-        db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
-    db_dir = os.path.abspath(db_path)
-
     from server.index_meta import read_meta
-    _meta = read_meta(db_dir)
-    stats = {
-        "total_chunks": 0,
-        "total_files": 0,
-        "indexed_files": [],
-        "db_size_bytes": 0,
-        "db_size": "0 B",
-        "model_alias": _meta["model_alias"] if _meta else None,
-        "dim": _meta["dim"] if _meta else None,
-    }
-    try:
-        store = VectorStore(db_dir)
-        indexed_files = sorted(
-            to_absolute(f, db_dir) for f in store.get_all_files()
-        )
-        size_bytes = store.db_size_bytes()
-        stats = {
-            "total_chunks": store.count_chunks(),
-            "total_files": len(indexed_files),
-            "indexed_files": indexed_files,
-            "db_size_bytes": size_bytes,
-            "db_size": _human_size(size_bytes),
-            "model_alias": _meta["model_alias"] if _meta else None,
-            "dim": _meta["dim"] if _meta else None,
+    from server.db_paths import resolve_db_dirs
+
+    db_dirs = resolve_db_dirs(db_path)
+    db_dir = db_dirs[0]  # used by the exclusions report below
+
+    index_entries: list[dict] = []
+    all_files: list[str] = []
+    for d in db_dirs:
+        meta = read_meta(d)
+        entry = {
+            "index_path": d,
+            "model_alias": meta["model_alias"] if meta else None,
+            "dim": meta["dim"] if meta else None,
+            "total_chunks": 0,
+            "total_files": 0,
+            "db_size_bytes": 0,
+            "db_size": "0 B",
         }
-    except Exception:
-        pass  # status must stay readable even if the DB is missing or busy
+        try:
+            store = VectorStore(d)
+            files = sorted(to_absolute(f, d) for f in store.get_all_files())
+            size_bytes = store.db_size_bytes()
+            entry.update(
+                total_chunks=store.count_chunks(),
+                total_files=len(files),
+                db_size_bytes=size_bytes,
+                db_size=_human_size(size_bytes),
+            )
+            all_files.extend(files)
+        except Exception:
+            pass  # status stays readable even if one index is missing/busy
+        index_entries.append(entry)
+
+    total_size = sum(e["db_size_bytes"] for e in index_entries)
+    single = len(index_entries) == 1
+    stats = {
+        "total_chunks": sum(e["total_chunks"] for e in index_entries),
+        "total_files": len(set(all_files)),
+        "indexed_files": sorted(set(all_files)),
+        "db_size_bytes": total_size,
+        "db_size": _human_size(total_size),
+        "model_alias": index_entries[0]["model_alias"] if single else None,
+        "dim": index_entries[0]["dim"] if single else None,
+        "indexes": index_entries,
+    }
 
     out: dict = {
         **stats,

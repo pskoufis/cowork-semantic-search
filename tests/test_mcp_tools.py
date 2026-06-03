@@ -956,3 +956,25 @@ async def test_mcp_get_index_status_model_null_when_no_meta(tmp_path):
         payload = _json.loads(result.content[0].text)
         assert payload["model_alias"] is None
         assert payload["dim"] is None
+
+
+@pytest.mark.anyio
+async def test_status_aggregates_across_indexes(tmp_path, monkeypatch):
+    import os
+    import json as _json
+    from server.index_meta import write_meta
+    from server.embedding_models import resolve_profile
+
+    a, b = str(tmp_path / "A"), str(tmp_path / "B")
+    write_meta(a, *resolve_profile("minilm", None))
+    write_meta(b, *resolve_profile("qwen3-0.6b", None))
+    monkeypatch.delenv("LANCEDB_PATH", raising=False)
+    monkeypatch.setenv("LANCEDB_PATHS", f"{a}{os.pathsep}{b}")
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_index_status", {})
+        payload = _json.loads(result.content[0].text)
+        aliases = {e["model_alias"] for e in payload["indexes"]}
+        assert aliases == {"minilm", "qwen3-0.6b"}
+        assert payload["total_chunks"] == 0  # nothing indexed, but both listed
+        assert len(payload["indexes"]) == 2
