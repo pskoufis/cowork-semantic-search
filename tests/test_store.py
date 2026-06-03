@@ -560,3 +560,30 @@ def test_evict_legacy_spreadsheet_chunks_empty_store(tmp_path):
     """Eviction on a fresh DB without the chunks table is a no-op."""
     store = VectorStore(str(tmp_path / "db"))
     assert store.evict_legacy_spreadsheet_chunks() == set()
+
+
+# --- configurable dimension (index_meta-driven) ---------------------------
+
+from server.index_meta import write_meta as _write_meta
+from server.embedding_models import resolve_profile as _resolve_profile
+
+
+def test_store_reads_dim_from_meta(tmp_path):
+    db = str(tmp_path / "idx384")
+    profile, dim = _resolve_profile("minilm", None)  # 384
+    _write_meta(db, profile, dim)
+    store = VectorStore(db)
+    table = store._ensure_table()
+    assert table.schema.field("vector").type.list_size == 384
+
+
+def test_store_explicit_dim_overrides(tmp_path):
+    store = VectorStore(str(tmp_path / "idx512"), dim=512)
+    table = store._ensure_table()
+    assert table.schema.field("vector").type.list_size == 512
+
+
+def test_store_legacy_default_dim(tmp_path):
+    store = VectorStore(str(tmp_path / "idxlegacy"))  # no meta
+    table = store._ensure_table()
+    assert table.schema.field("vector").type.list_size == EMBEDDING_DIM  # 256
