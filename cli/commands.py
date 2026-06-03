@@ -80,6 +80,11 @@ def status_cmd(db_path: str) -> int:
     print(f"  total chunks: {chunks:,}")
     print(f"  total files:  {files:,}")
 
+    from server.index_meta import read_meta
+    _meta = read_meta(db_path)
+    if _meta:
+        print(f"  model:        {_meta['model_alias']} ({_meta['dim']}-dim)")
+
     jobs_path = db_path + ".jobs.json"
     if os.path.exists(jobs_path):
         from server.jobs import JobRegistry

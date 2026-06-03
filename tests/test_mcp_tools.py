@@ -925,3 +925,34 @@ async def test_reindex_file_routes_xlsx_to_queue(tmp_path):
     assert data["needs"] == ["sheet:S1", "sheet:S2", "file"]
     fresh = VectorStore(db)
     assert fresh.pending_count() == 1
+
+
+@pytest.mark.anyio
+async def test_mcp_get_index_status_reports_model_and_dim(tmp_path):
+    """get_index_status surfaces the index's recorded embedding model/dim."""
+    import json as _json
+    from server.index_meta import write_meta
+    from server.embedding_models import resolve_profile
+
+    db_path = str(tmp_path / "idx")
+    profile, dim = resolve_profile("minilm", None)
+    write_meta(db_path, profile, dim)
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_index_status", {"db_path": db_path})
+        assert not result.is_error
+        payload = _json.loads(result.content[0].text)
+        assert payload["model_alias"] == "minilm"
+        assert payload["dim"] == 384
+
+
+@pytest.mark.anyio
+async def test_mcp_get_index_status_model_null_when_no_meta(tmp_path):
+    """A legacy index without a sidecar reports model_alias/dim as null."""
+    import json as _json
+    db_path = str(tmp_path / "legacy")
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_index_status", {"db_path": db_path})
+        payload = _json.loads(result.content[0].text)
+        assert payload["model_alias"] is None
+        assert payload["dim"] is None
