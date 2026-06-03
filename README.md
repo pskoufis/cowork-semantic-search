@@ -242,6 +242,39 @@ Global options: `--db-path` (overrides `LANCEDB_PATH`), `--verbose` (show DEBUG)
 ## Advanced Usage
 
 <details>
+<summary><strong>Choosing an embedding model</strong></summary>
+
+The default embedding model is `qwen3-0.6b` (256-dim). Set `EMBEDDING_MODEL`
+(and optionally `EMBEDDING_DIM`) when **creating** an index to pick a different
+one. Available aliases:
+
+| alias | model | dim | notes |
+|---|---|---|---|
+| `qwen3-0.6b` | Qwen/Qwen3-Embedding-0.6B | 256 (64–1024) | default; highest quality, heaviest |
+| `bge-small` | BAAI/bge-small-en-v1.5 | 384 | strong quality-per-speed |
+| `gte-small` | thenlper/gte-small | 384 | good all-rounder |
+| `minilm` | all-MiniLM-L6-v2 | 384 | tiny and fast |
+| `static-mrl` | static-retrieval-mrl-en-v1 | 256 (64–1024) | extreme CPU speed, lower quality |
+
+Each index records its model in `index_meta.json`; **search and status read
+that automatically**, so you only ever set these vars at index time. An index
+is permanently bound to the model that built it — use a separate `--db-path` /
+`LANCEDB_PATH` per model, and re-indexing an existing index with a conflicting
+model is rejected rather than corrupting it.
+
+```bash
+# Build a separate, faster bge-small index over just the .txt files
+EMBEDDING_MODEL=bge-small csemsearch --db-path ./idx-bge index ./corpus --types .txt
+# Search it — no env needed; the index knows its own model
+csemsearch --db-path ./idx-bge search "quarterly revenue"
+```
+
+For the MCP server, set it in the `env` block (alongside `LANCEDB_PATH`) and
+restart the client so the new index is built with the chosen model.
+
+</details>
+
+<details>
 <summary><strong>Portable index (external drive)</strong></summary>
 
 By default the index lives in `./lancedb` next to the server. To make the index **portable** -- so it survives an external drive being re-plugged at a different mount point, or moved between Macs -- set the `LANCEDB_PATH` environment variable to a directory **on the same drive as your documents**:
