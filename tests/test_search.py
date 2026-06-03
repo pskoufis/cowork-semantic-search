@@ -224,3 +224,104 @@ def test_search_loads_model_from_meta_ignoring_env(tmp_path, monkeypatch):
     assert captured["alias"] == "minilm"
     assert captured["dim"] == 384
     assert out["total_results"] >= 1
+
+
+# --- multi-index: search_one provenance tagging ---------------------------
+
+from server.search import search_one
+
+
+def test_search_one_tags_results_with_origin(tmp_path, monkeypatch):
+    from server.index_meta import write_meta as _wm
+    from server.embedding_models import resolve_profile as _rp
+    db = str(tmp_path / "idx")
+    profile, dim = _rp("minilm", None)  # 384
+    _wm(db, profile, dim)
+    store = VectorStore(db, dim=384)
+    chunks = []
+    for i, text in enumerate(["alpha", "beta"]):
+        vec = _fake_embed_384([text])[0]
+        chunks.append({
+            "id": f"c_{i}", "text": text, "source_file": "corpus/d.txt",
+            "file_name": "d.txt", "file_type": ".txt", "folder_path": "corpus",
+            "chunk_index": i, "content_hash": "h", "mtime_ns": 0, "file_size": 0,
+            "vector": vec.tolist(),
+        })
+    store.add_chunks(chunks)
+
+    def fake_get_model(p, d):
+        return type("M", (), {"encode": lambda self, t, **k: _fake_embed_384(t)})()
+
+    with patch("server.search.get_model", fake_get_model):
+        hits = search_one(db, "alpha", top_k=10, folder_path=None,
+                          file_type=None, mode="vector")
+    assert hits, "expected at least one hit"
+    assert all(h["index_path"] == os.path.abspath(db) for h in hits)
+    assert all(h["model_alias"] == "minilm" for h in hits)
+
+
+# --- multi-index: semantic_search fan-out ---------------------------------
+
+def test_semantic_search_fans_out_over_two_indexes(tmp_path, monkeypatch):
+    from server.index_meta import write_meta as _wm
+    from server.embedding_models import resolve_profile as _rp
+
+    def seed(db, texts):
+        profile, dim = _rp("minilm", None)
+        _wm(db, profile, dim)
+        s = VectorStore(db, dim=384)
+        rows = []
+        for i, t in enumerate(texts):
+            v = _fake_embed_384([t])[0]
+            rows.append({
+                "id": f"{db}_{i}", "text": t, "source_file": f"corpus/{i}.txt",
+                "file_name": f"{i}.txt", "file_type": ".txt", "folder_path": "corpus",
+                "chunk_index": 0, "content_hash": "h", "mtime_ns": 0, "file_size": 0,
+                "vector": v.tolist(),
+            })
+        s.add_chunks(rows)
+
+    a, b = str(tmp_path / "A"), str(tmp_path / "B")
+    seed(a, ["alpha one"])
+    seed(b, ["alpha two"])
+    monkeypatch.delenv("LANCEDB_PATH", raising=False)
+    monkeypatch.setenv("LANCEDB_PATHS", f"{a}{os.pathsep}{b}")
+
+    def fake_get_model(p, d):
+        return type("M", (), {"encode": lambda self, t, **k: _fake_embed_384(t)})()
+
+    with patch("server.search.get_model", fake_get_model):
+        out = semantic_search("alpha", db_path=None)
+
+    assert set(out["indexes_searched"]) == {os.path.abspath(a), os.path.abspath(b)}
+    origins = {r["index_path"] for r in out["results"]}
+    assert origins == {os.path.abspath(a), os.path.abspath(b)}
+
+
+def test_semantic_search_skips_missing_index(tmp_path, monkeypatch):
+    from server.index_meta import write_meta as _wm
+    from server.embedding_models import resolve_profile as _rp
+    good = str(tmp_path / "good")
+    profile, dim = _rp("minilm", None)
+    _wm(good, profile, dim)
+    s = VectorStore(good, dim=384)
+    v = _fake_embed_384(["hello"])[0]
+    s.add_chunks([{
+        "id": "g0", "text": "hello", "source_file": "c/h.txt", "file_name": "h.txt",
+        "file_type": ".txt", "folder_path": "c", "chunk_index": 0, "content_hash": "h",
+        "mtime_ns": 0, "file_size": 0, "vector": v.tolist(),
+    }])
+    # A regular file (not a dir) makes lancedb.connect raise -> the index is
+    # skipped, not fatal.
+    broken = str(tmp_path / "broken")
+    (tmp_path / "broken").write_text("not a lancedb")
+    monkeypatch.delenv("LANCEDB_PATH", raising=False)
+    monkeypatch.setenv("LANCEDB_PATHS", f"{good}{os.pathsep}{broken}")
+
+    def fake_get_model(p, d):
+        return type("M", (), {"encode": lambda self, t, **k: _fake_embed_384(t)})()
+
+    with patch("server.search.get_model", fake_get_model):
+        out = semantic_search("hello", db_path=None)
+    assert out["total_results"] >= 1
+    assert any(s_["index"] == os.path.abspath(broken) for s_ in out["skipped"])
