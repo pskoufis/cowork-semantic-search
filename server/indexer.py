@@ -214,6 +214,18 @@ def compute_file_hash(file_path: Path) -> str:
     return h.hexdigest()
 
 
+def _resolve_run_profile(db_dir: str, for_write: bool):
+    """Resolve (profile, dim) for a write run from EMBEDDING_MODEL/EMBEDDING_DIM
+    env vars reconciled against the index's recorded sidecar."""
+    from server.index_meta import resolve_index_profile
+    env_alias = os.environ.get("EMBEDDING_MODEL")
+    _env_dim_raw = os.environ.get("EMBEDDING_DIM")
+    env_dim = int(_env_dim_raw) if _env_dim_raw else None
+    return resolve_index_profile(
+        db_dir, env_alias=env_alias, env_dim=env_dim, for_write=for_write
+    )
+
+
 def embed_chunks(chunks: list[dict], model, profile) -> list[dict]:
     texts = [c["text"] for c in chunks]
     all_embeddings = []
@@ -293,8 +305,12 @@ def reindex_one_file(file_path: str, db_path: str | None = None) -> dict:
 
     source_rel = to_relative(str(path), db_dir)
 
-    store = VectorStore(db_dir)
+    profile, dim = _resolve_run_profile(db_dir, for_write=True)
+    store = VectorStore(db_dir, dim=dim)
     store.ensure_schema()
+    from server.index_meta import write_meta
+    write_meta(db_dir, profile, dim)
+    model = get_model(profile, dim)
     store.delete_by_file(source_rel)
 
     if path.suffix.lower() in SPREADSHEET_EXTENSIONS:
@@ -325,7 +341,7 @@ def reindex_one_file(file_path: str, db_path: str | None = None) -> dict:
     file_hash = compute_file_hash(path)
 
     if chunks:
-        chunks = embed_chunks(chunks)
+        chunks = embed_chunks(chunks, model, profile)
         for c in chunks:
             c["content_hash"] = file_hash
             c["mtime_ns"] = stat.st_mtime_ns
@@ -404,8 +420,14 @@ def index_folder(
     if unpack_first:
         run_unpack_passes(folder, recursive=recursive, exclusions=exclusions)
 
-    store = VectorStore(db_dir)
+    # Resolve the embedding model/dim for this run (env, reconciled against any
+    # existing index sidecar) and record it so search/status self-describe.
+    profile, dim = _resolve_run_profile(db_dir, for_write=True)
+    store = VectorStore(db_dir, dim=dim)
     store.ensure_schema()  # migrate older indexes in place, if needed
+    from server.index_meta import write_meta
+    write_meta(db_dir, profile, dim)
+    model = get_model(profile, dim)
     # One-shot eviction: drop any legacy CSV/XLSX text chunks so they're
     # re-processed via the description path on this run. The returned set
     # tells the per-file loop to bypass the content_hash short-circuit for
@@ -598,7 +620,7 @@ def index_folder(
             parts = extract_text(file_path)
             chunks = chunk_document(parts, source_rel)
             if chunks:
-                chunks = embed_chunks(chunks)
+                chunks = embed_chunks(chunks, model, profile)
                 for c in chunks:
                     c["content_hash"] = file_hash
                     c["mtime_ns"] = mtime_ns

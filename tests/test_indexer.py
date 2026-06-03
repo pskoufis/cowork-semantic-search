@@ -1116,3 +1116,60 @@ def test_index_folder_cancel_event_persists_completed_work(
 
     assert indexed_first + indexed_second == 4
     assert skipped_second == indexed_first
+
+
+# --- configurable embedding model wiring ----------------------------------
+
+def _fake_embed_dim(texts, dim):
+    out = []
+    for t in texts:
+        rng = np.random.RandomState(hash(t) % 2**32)
+        v = rng.randn(dim).astype(np.float32)
+        v = v / np.linalg.norm(v)
+        out.append(v)
+    return np.array(out)
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_writes_meta_and_respects_env(mock_get_model, tmp_path, monkeypatch):
+    """EMBEDDING_MODEL selects the model for a new index and is recorded in
+    index_meta.json so search/status can self-describe."""
+    mock_model = type(
+        "MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed_dim(texts, 384)}
+    )()
+    mock_get_model.return_value = mock_model
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.txt").write_text("hello world from minilm")
+    db = str(tmp_path / "idx")
+    monkeypatch.setenv("EMBEDDING_MODEL", "minilm")
+
+    from server.index_meta import read_meta
+    index_folder(str(corpus), db_path=db, unpack_first=False)
+
+    meta = read_meta(db)
+    assert meta["model_alias"] == "minilm"
+    assert meta["dim"] == 384
+    # The store was created at the configured width.
+    assert VectorStore(db).count_chunks() >= 1
+
+
+@patch("server.indexer.get_model")
+def test_index_folder_rejects_conflicting_model(mock_get_model, tmp_path, monkeypatch):
+    """Re-indexing an existing index with a different EMBEDDING_MODEL fails
+    loudly instead of writing incompatible vectors."""
+    mock_get_model.return_value = type(
+        "MockModel", (), {"encode": lambda self, texts, **kw: _fake_embed_dim(texts, 384)}
+    )()
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.txt").write_text("seed")
+    db = str(tmp_path / "idx")
+    monkeypatch.setenv("EMBEDDING_MODEL", "minilm")
+    index_folder(str(corpus), db_path=db, unpack_first=False)
+
+    monkeypatch.setenv("EMBEDDING_MODEL", "bge-small")
+    with pytest.raises(ValueError) as exc:
+        index_folder(str(corpus), db_path=db, unpack_first=False)
+    assert "minilm" in str(exc.value) and "bge-small" in str(exc.value)

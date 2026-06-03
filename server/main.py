@@ -313,12 +313,16 @@ def get_index_status(
         db_path = os.environ.get("LANCEDB_PATH", "./lancedb")
     db_dir = os.path.abspath(db_path)
 
+    from server.index_meta import read_meta
+    _meta = read_meta(db_dir)
     stats = {
         "total_chunks": 0,
         "total_files": 0,
         "indexed_files": [],
         "db_size_bytes": 0,
         "db_size": "0 B",
+        "model_alias": _meta["model_alias"] if _meta else None,
+        "dim": _meta["dim"] if _meta else None,
     }
     try:
         store = VectorStore(db_dir)
@@ -332,6 +336,8 @@ def get_index_status(
             "indexed_files": indexed_files,
             "db_size_bytes": size_bytes,
             "db_size": _human_size(size_bytes),
+            "model_alias": _meta["model_alias"] if _meta else None,
+            "dim": _meta["dim"] if _meta else None,
         }
     except Exception:
         pass  # status must stay readable even if the DB is missing or busy
@@ -518,8 +524,16 @@ def _submit_one_description(
         return {"status": "rejected", "reason": "description_too_large"}
 
     source_rel = to_relative(str(path), db_dir)
-    store = VectorStore(db_dir)
+    # Description rows land in the same chunks table, so they must be embedded
+    # with the model the index was built with (recorded sidecar; env ignored).
+    from server.index_meta import resolve_index_profile
+    from server.indexer import get_model
+    profile, dim = resolve_index_profile(
+        db_dir, env_alias=None, env_dim=None, for_write=False
+    )
+    store = VectorStore(db_dir, dim=dim)
     store.ensure_schema()
+    model = get_model(profile, dim)
 
     entry = store.get_pending_entry(source_rel)
     if entry is None:
@@ -553,7 +567,7 @@ def _submit_one_description(
         "chunk_kind": chunk_kind,
         "sheet_name": sheet_name,
     }
-    [chunk] = embed_chunks([chunk])
+    [chunk] = embed_chunks([chunk], model, profile)
     store.add_chunks([chunk])
 
     remaining = [n for n in entry["needs"] if n != needed_item]
@@ -639,12 +653,19 @@ async def _auto_drain_descriptions(db_dir: str, ctx) -> int:
     from pathlib import Path
     from server.store import VectorStore
     from server.paths import to_absolute
-    from server.indexer import embed_chunks
+    from server.indexer import embed_chunks, get_model
+    from server.index_meta import resolve_index_profile
     from server.spreadsheets import (
         build_sheet_prompt, build_file_prompt, needs_for_preview,
     )
 
-    store = VectorStore(db_dir)
+    # Description rows share the chunks table, so embed with the index's
+    # recorded model (env ignored on this append-to-existing-index path).
+    profile, dim = resolve_index_profile(
+        db_dir, env_alias=None, env_dim=None, for_write=False
+    )
+    store = VectorStore(db_dir, dim=dim)
+    model = get_model(profile, dim)
     written = 0
     failed_paths: set[str] = set()
 
@@ -714,7 +735,7 @@ async def _auto_drain_descriptions(db_dir: str, ctx) -> int:
             ))
 
             # Atomic commit
-            chunks = embed_chunks(chunks)
+            chunks = embed_chunks(chunks, model, profile)
             store.add_chunks(chunks)
             store.remove_pending(entry["file_path"])
             written += len(chunks)
